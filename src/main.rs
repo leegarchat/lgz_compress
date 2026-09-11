@@ -455,7 +455,13 @@ fn cmd_extract(program: &str, args: &[String]) -> Result<(), Error> {
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
-    let program = argv.first().map(String::as_str).unwrap_or("lgz_compress");
+    // Basename only: a long invocation path would otherwise stretch every
+    // help/usage line (e.g. ./target/release/lgz_compress).
+    let program_full = argv.first().map(String::as_str).unwrap_or("lgz_compress");
+    let program = std::path::Path::new(program_full)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(program_full);
     let args: &[String] = &argv[1..];
 
     let result = match args.first().map(String::as_str) {
