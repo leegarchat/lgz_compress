@@ -12,9 +12,13 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
-lzma-rust2 = "0.20"
-rayon = "1.10"
+lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "optimization"] }
+rayon = { version = "1.10", optional = true }
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
+[features]
+default = ["compress"]
+compress = ["dep:rayon", "lzma-rust2/encoder"]
 
 [profile.release]
 opt-level = 3

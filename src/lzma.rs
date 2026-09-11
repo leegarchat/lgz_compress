@@ -17,15 +17,22 @@
 //!   (32/128/2048/auto). Exact search behavior differs between the two
 //!   match finders, so ratios are compared empirically, not bit-by-bit.
 
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(feature = "compress")]
+use std::io::Write;
 
-use lzma_rust2::{EncodeMode, Lzma2Options, Lzma2Reader, Lzma2Writer, LzmaOptions, MfType};
+use lzma_rust2::Lzma2Reader;
+#[cfg(feature = "compress")]
+use lzma_rust2::{EncodeMode, Lzma2Options, Lzma2Writer, LzmaOptions, MfType};
 
 use crate::error::Error;
 
 /// Max dictionary: 16 MiB normally, 32 MiB on level 3, and 64 MiB on
 /// level 3 for inputs over 32 MiB (ramdisk-scale solids on modern devices
 /// with 8-16 GB RAM). Mirrors `get_optimal_dict_size` in lgzv3.c, extended.
+/// Encode-only (`compress` feature): the decompress-only ramdisk build
+/// never sizes dictionaries.
+#[cfg(feature = "compress")]
 pub fn optimal_dict_size(in_size: u64, opt_level: u8) -> u32 {
     let max_dict: u64 = if opt_level >= 3 {
         if in_size > 32 * 1024 * 1024 {
@@ -47,6 +54,8 @@ pub fn optimal_dict_size(in_size: u64, opt_level: u8) -> u32 {
 ///
 /// Heuristic mapping of C's `mc` (48/256/4096/500000). `0` means automatic
 /// (derived from `nice_len`), used for the extreme level.
+/// Encode-only.
+#[cfg(feature = "compress")]
 fn depth_limit(opt_level: u8) -> i32 {
     match opt_level {
         0 => 32,
@@ -65,6 +74,8 @@ fn decode_props(prop: u8) -> u32 {
 ///
 /// For props 0..=39 the decoded size is `(2 | (prop & 1)) << (prop / 2 + 11)`.
 /// Returns the smallest props byte whose decoded size fits `dict_size`.
+/// Encode-only.
+#[cfg(feature = "compress")]
 pub fn dict_props_byte(dict_size: u32) -> u8 {
     for prop in 0..40u8 {
         if decode_props(prop) >= dict_size {
@@ -90,6 +101,8 @@ pub fn dict_size_from_props(prop: u8) -> Option<u32> {
 }
 
 /// Build encoder options for the given brute-force parameters.
+/// Encode-only.
+#[cfg(feature = "compress")]
 fn make_options(in_size: u64, lc: u32, lp: u32, pb: u32, opt_level: u8) -> Lzma2Options {
     let dict_size = optimal_dict_size(in_size, opt_level);
     let lzma_options = LzmaOptions::new(
@@ -112,6 +125,8 @@ fn make_options(in_size: u64, lc: u32, lp: u32, pb: u32, opt_level: u8) -> Lzma2
 ///
 /// Port of `lzma_compress_buf`. The returned length already includes the
 /// leading props byte, matching C's `*out_size = 1 + comp_size`.
+/// Encode-only (`compress` feature).
+#[cfg(feature = "compress")]
 pub fn compress_buf(
     input: &[u8],
     lc: u32,

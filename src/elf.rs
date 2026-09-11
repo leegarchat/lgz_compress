@@ -29,6 +29,8 @@ pub struct ElfInfo {
     pub sections: Vec<Section>,
     pub arch: Arch,
     /// Raw `e_type`: 2 = executable, 3 = shared object, 1 = relocatable.
+    /// Pack-side only (solid clustering); absent in decompress-only builds.
+    #[cfg(feature = "compress")]
     pub e_type: u16,
 }
 
@@ -128,6 +130,7 @@ pub fn parse(data: &[u8]) -> Option<ElfInfo> {
     Some(ElfInfo {
         sections,
         arch,
+        #[cfg(feature = "compress")]
         e_type: u16le(data, 16),
     })
 }

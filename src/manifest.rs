@@ -17,9 +17,12 @@
 //!   blob and the archive is rebuilt on unpack (a plain `file` line whose
 //!   target looks like a zip is ingested the same way).
 
+# [cfg(feature = "compress")]
 use std::collections::HashSet;
 
+# [cfg(feature = "compress")]
 use crate::error::Error;
+# [cfg(feature = "compress")]
 use crate::meta::{self, FileMeta};
 
 /// Entry type requested by the manifest.
@@ -35,6 +38,7 @@ pub enum EntryKind {
 
 /// One parsed manifest line.
 #[derive(Debug, Clone)]
+# [cfg(feature = "compress")]
 pub struct ManifestEntry {
     pub kind: EntryKind,
     pub path: String,
@@ -46,6 +50,7 @@ pub struct ManifestEntry {
     pub line_no: usize,
 }
 
+# [cfg(feature = "compress")]
 fn parse_meta_slots(
     slots: &[&str],
     line_no: usize,
@@ -83,6 +88,7 @@ fn parse_meta_slots(
 }
 
 /// Parse manifest text into entry specs.
+# [cfg(feature = "compress")]
 pub fn parse_manifest(text: &str) -> Result<Vec<ManifestEntry>, Error> {
     let mut entries = Vec::new();
     let mut seen = HashSet::new();

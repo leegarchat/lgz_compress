@@ -45,9 +45,12 @@ Examples:
 
 Outputs:
   dist/                      Static binaries lgz_compress-linux-*
+                             (full build: compress + pack + unpack)
   target/push/               Push-ready copies {name}_{arch} (x64, x86,
                              arm64, arm32), e.g. for: adb push
                              target/push/lgz_compress_arm64 /data/local/
+                             (decompress-only build: unpack/inspect only,
+                             for ramdisk use on device)
 EOF
     exit 0
 }
@@ -215,32 +218,10 @@ build_target() {
     echo "Building [$output_name] -> $target"
     echo "------------------------------------------------------------"
 
-    if [[ "$BUILDER" == "cross" ]]; then
-        cross build --release --target "$target"
-    else
-        if ! check_cargo_linker "$target"; then
-            exit 1
-        fi
-        case "$target" in
-            "$TARGET_ARM64")
-                export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="aarch64-linux-gnu-gcc"
-                ;;
-            "$TARGET_ARM32")
-                export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER="arm-linux-gnueabihf-gcc"
-                ;;
-            "$TARGET_X86")
-                export CARGO_TARGET_I686_UNKNOWN_LINUX_MUSL_LINKER="i686-linux-gnu-gcc"
-                ;;
-            "$TARGET_X64")
-                if command -v musl-gcc &>/dev/null; then
-                    export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="musl-gcc"
-                fi
-                ;;
-        esac
+    setup_linkers "$target"
 
-        cargo build --release --target "$target"
-    fi
-
+    # 1) Full build (default features): host utility for dist/.
+    run_builder "$target" ""
     local src_bin="$SCRIPT_DIR/target/$target/release/$BIN_NAME"
     local dst_bin="$DIST_DIR/${BIN_NAME}-${output_name}"
 
@@ -254,18 +235,74 @@ build_target() {
 
         local size
         size=$(stat -c%s "$dst_bin" 2>/dev/null || stat -f%z "$dst_bin")
-        echo "Success: $dst_bin ($size bytes)"
-
-        # Post-process: adb-push-ready copy as target/push/{name}_{arch}
-        # (e.g. target/push/lgz_compress_arm64 for `adb push` to
-        # /data/local on devices). target/ is gitignored; push/ is kept
-        # across runs (only overwritten per built arch).
-        mkdir -p "$PUSH_DIR"
-        cp "$dst_bin" "$PUSH_DIR/${BIN_NAME}_${short_arch}"
-        echo "Push copy: $PUSH_DIR/${BIN_NAME}_${short_arch}"
+        echo "Success: $dst_bin ($size bytes) [full]"
     else
         echo "Error: compiled binary not found: $src_bin"
         exit 1
+    fi
+
+    # 2) Decompress-only build (--no-default-features): lean binary for
+    # adb push to the device (ramdisk only unpacks/inspects).
+    # Post-process: adb-push-ready copy as target/push/{name}_{arch}
+    # (e.g. target/push/lgz_compress_arm64 for `adb push` to
+    # /data/local on devices). target/ is gitignored; push/ is kept
+    # across runs (only overwritten per built arch).
+    run_builder "$target" "--no-default-features"
+
+    if [[ -f "$src_bin" ]]; then
+        mkdir -p "$PUSH_DIR"
+        local push_bin="$PUSH_DIR/${BIN_NAME}_${short_arch}"
+        cp "$src_bin" "$push_bin"
+
+        if command -v strip &>/dev/null; then
+            strip "$push_bin" 2>/dev/null || true
+        fi
+
+        local push_size
+        push_size=$(stat -c%s "$push_bin" 2>/dev/null || stat -f%z "$push_bin")
+        echo "Push copy: $push_bin ($push_size bytes) [decompress-only]"
+    else
+        echo "Error: compiled binary not found: $src_bin"
+        exit 1
+    fi
+}
+
+# Set cross linkers for local cargo builds (no-op for cross).
+setup_linkers() {
+    local target="$1"
+    if [[ "$BUILDER" != "cargo" ]]; then
+        return 0
+    fi
+    if ! check_cargo_linker "$target"; then
+        exit 1
+    fi
+    case "$target" in
+        "$TARGET_ARM64")
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="aarch64-linux-gnu-gcc"
+            ;;
+        "$TARGET_ARM32")
+            export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER="arm-linux-gnueabihf-gcc"
+            ;;
+        "$TARGET_X86")
+            export CARGO_TARGET_I686_UNKNOWN_LINUX_MUSL_LINKER="i686-linux-gnu-gcc"
+            ;;
+        "$TARGET_X64")
+            if command -v musl-gcc &>/dev/null; then
+                export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="musl-gcc"
+            fi
+            ;;
+    esac
+}
+
+# Run the selected builder for one target; extra args (feature flags)
+# are appended to the build command.
+run_builder() {
+    local target="$1"
+    shift
+    if [[ "$BUILDER" == "cross" ]]; then
+        cross build --release --target "$target" "$@"
+    else
+        cargo build --release --target "$target" "$@"
     fi
 }
 

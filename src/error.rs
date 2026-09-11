@@ -19,6 +19,8 @@ pub enum Error {
     /// Metadata error (mode/owner/context parsing or application).
     Meta(String),
     /// Manifest error (syntax, missing files, unsafe paths).
+    /// Pack-side only; decompress-only builds never parse manifests.
+    #[cfg(feature = "compress")]
     Manifest(String),
     /// Command-line usage error.
     Usage(String),
@@ -32,6 +34,7 @@ impl fmt::Display for Error {
             Error::BadArchive(e) => write!(f, "bad archive: {e}"),
             Error::TooLarge(e) => write!(f, "limit exceeded: {e}"),
             Error::Meta(e) => write!(f, "metadata error: {e}"),
+            #[cfg(feature = "compress")]
             Error::Manifest(e) => write!(f, "manifest error: {e}"),
             Error::Usage(e) => write!(f, "{e}"),
         }

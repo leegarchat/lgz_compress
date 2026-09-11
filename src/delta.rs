@@ -4,6 +4,8 @@
 //! Arithmetic uses `wrapping_*`, matching unsigned `uint8_t` arithmetic in C.
 
 /// Forward delta encoding: `data[i] -= data[i-1]`, from the end.
+# [cfg(feature = "compress")]
+# [cfg(feature = "compress")]
 pub fn encode(data: &mut [u8]) {
     if data.len() < 2 {
         return;

@@ -147,11 +147,13 @@ pub fn decompress_file(in_path: &str, out_path: &str) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compress"))]
 mod tests {
     use super::*;
 
     /// Sanity: a plain (type 0) chunk round-trips through the header codec.
+    /// Needs the encoder, so it only runs with the `compress` feature.
+    #[cfg(feature = "compress")]
     #[test]
     fn plain_chunk_roundtrip() {
         let orig: Vec<u8> = (0..256).map(|i| (i * 7 + 3) as u8).collect();

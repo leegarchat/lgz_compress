@@ -55,12 +55,18 @@ use std::ops::Range;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(feature = "compress")]
 use crate::compress::{self, Chunk};
 use crate::decompress;
+#[cfg(feature = "compress")]
 use crate::elf::{self, Arch};
 use crate::error::Error;
-use crate::manifest::{self, EntryKind, ManifestEntry};
-use crate::meta::{self, FileMeta, Preserve};
+use crate::manifest::EntryKind;
+#[cfg(feature = "compress")]
+use crate::manifest::{ManifestEntry, parse_manifest};
+use crate::meta::{self, FileMeta};
+#[cfg(feature = "compress")]
+use crate::meta::Preserve;
 use crate::normalize;
 
 /// Container magic.
@@ -134,7 +140,10 @@ pub struct ZipInner {
     /// Full unix mode from the zip (perm bits used on rebuild).
     pub unix_mode: u32,
     pub mtime: ZipTime,
-    /// Files: crc32 of the raw bytes (integrity reference).
+    /// Files: crc32 of the raw bytes. Integrity reference recorded at
+    /// ingest (the reader already verifies it); the rebuild writer
+    /// recomputes CRCs itself, so this is not read back on unpack.
+    #[allow(dead_code)]
     pub crc: u32,
     /// Symlinks: target path.
     pub link_target: Option<String>,
@@ -146,7 +155,8 @@ pub struct ZipInner {
 }
 
 /// Pack options: optimizer level, worker threads, forced metadata,
-/// filesystem preserve flags.
+/// filesystem preserve flags. Encode-only (`compress` feature).
+#[cfg(feature = "compress")]
 #[derive(Debug, Clone, Default)]
 pub struct PackOptions {
     pub opt_level: u8,
@@ -158,6 +168,7 @@ pub struct PackOptions {
     pub preserve: Preserve,
 }
 
+#[cfg(feature = "compress")]
 impl PackOptions {
     /// Resolve the worker thread count (>= 1).
     pub fn resolve_threads(&self) -> usize {
@@ -169,29 +180,35 @@ impl PackOptions {
 // Container encode/decode.
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "compress")]
 fn check_len(len: usize, what: &str) -> Result<u16, Error> {
     u16::try_from(len)
         .map_err(|_| Error::TooLarge(format!("{what} exceeds 64 KiB")))
 }
 
+#[cfg(feature = "compress")]
 fn push_u16(out: &mut Vec<u8>, v: u16) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
+#[cfg(feature = "compress")]
 fn push_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
+#[cfg(feature = "compress")]
 fn push_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
+#[cfg(feature = "compress")]
 fn push_str(out: &mut Vec<u8>, s: &str, what: &str) -> Result<(), Error> {
     push_u16(out, check_len(s.len(), what)?);
     out.extend_from_slice(s.as_bytes());
     Ok(())
 }
 
+#[cfg(feature = "compress")]
 fn push_ztime(out: &mut Vec<u8>, t: &ZipTime) {
     push_u16(out, t.year);
     out.push(t.month);
@@ -202,6 +219,7 @@ fn push_ztime(out: &mut Vec<u8>, t: &ZipTime) {
 }
 
 /// Serialize one ingested zip inner entry.
+#[cfg(feature = "compress")]
 fn encode_zip_inner(out: &mut Vec<u8>, z: &ZipInner) -> Result<(), Error> {
     out.push(z.kind);
     push_str(&mut *out, &z.path, "zip inner path")?;
@@ -245,6 +263,7 @@ fn encode_zip_inner(out: &mut Vec<u8>, z: &ZipInner) -> Result<(), Error> {
 }
 
 /// Serialize entries + solid payload into a UCOMP02 image.
+#[cfg(feature = "compress")]
 pub fn encode_container(entries: &[PackEntry], solid: &[u8]) -> Result<Vec<u8>, Error> {
     if entries.len() > u32::MAX as usize {
         return Err(Error::TooLarge("too many entries".to_string()));
@@ -582,6 +601,7 @@ pub fn parse_container(data: &[u8]) -> Result<(Vec<PackEntry>, Range<usize>), Er
 /// needs to invert the transform, and the ELF identity (arch + e_type)
 /// used for pre-packing clustering. Non-ELF files pass through untouched
 /// with no ranges.
+#[cfg(feature = "compress")]
 fn normalize_for_solid(data: &[u8]) -> (Vec<u8>, Vec<CodeRange>, Option<(Arch, u16)>) {
     let Some(info) = elf::parse(data) else {
         return (data.to_vec(), Vec::new(), None);
@@ -619,6 +639,7 @@ fn normalize_for_solid(data: &[u8]) -> (Vec<u8>, Vec<CodeRange>, Option<(Arch, u
 /// `zip_works` holds normalized inner blobs (zip entries only).
 /// Solid offsets are assigned later, after clustering.
 /// `sort` is the cluster key for top-level files.
+#[cfg(feature = "compress")]
 struct ResolvedEntry {
     entry: PackEntry,
     blob: Option<Vec<u8>>,
@@ -627,6 +648,7 @@ struct ResolvedEntry {
 }
 
 /// One ingested zip inner file awaiting a solid slot.
+#[cfg(feature = "compress")]
 struct ZipWork {
     /// Index into the owning entry's `zip_inners`.
     inner_idx: usize,
@@ -638,6 +660,7 @@ struct ZipWork {
 /// other ELF, then scripts, then remaining data. Names order
 /// lexicographically inside a class so related libraries (same CRT
 /// glue, similar symbols) land next to each other.
+#[cfg(feature = "compress")]
 fn classify(path: &str, data: &[u8], elf_id: Option<(Arch, u16)>) -> (u8, String) {
     let class = match elf_id {
         Some((Arch::Arm64, 2)) => 0,
@@ -651,6 +674,7 @@ fn classify(path: &str, data: &[u8], elf_id: Option<(Arch, u16)>) -> (u8, String
 
 /// Heuristic zip detection for `file` manifest lines: known extensions
 /// or a zip signature (local header, central directory, end record).
+#[cfg(feature = "compress")]
 fn looks_like_zip(path: &str, head: &[u8]) -> bool {
     let lower = path.to_lowercase();
     lower.ends_with(".zip") || lower.ends_with(".jar") || lower.ends_with(".apk")
@@ -659,6 +683,7 @@ fn looks_like_zip(path: &str, head: &[u8]) -> bool {
         || head.starts_with(b"PK\x05\x06")
 }
 
+#[cfg(feature = "compress")]
 fn zip_time_from(dt: Option<zip::DateTime>) -> ZipTime {
     match dt {
         Some(t) => ZipTime {
@@ -686,6 +711,7 @@ fn zip_time_from(dt: Option<zip::DateTime>) -> ZipTime {
 /// Only stored/deflated entries are supported; anything else (bzip2, zstd,
 /// encrypted, unsafe names, duplicates) is a hard error — silently
 /// degrading a ramdisk archive is worse than refusing it.
+#[cfg(feature = "compress")]
 fn ingest_zip(
     spec: &ManifestEntry,
     raw: &[u8],
@@ -825,6 +851,7 @@ fn ingest_zip(
 /// Returns the entry (`None` for skipped special files). File contents are
 /// returned separately; the caller clusters files and lays out the solid
 /// blob afterwards.
+#[cfg(feature = "compress")]
 fn resolve_entry(
     spec: &ManifestEntry,
     opts: &PackOptions,
@@ -963,9 +990,10 @@ fn resolve_entry(
 }
 
 /// Pack the files listed in `manifest_path` into one UCOMP02 archive.
+#[cfg(feature = "compress")]
 pub fn pack(manifest_path: &str, out_path: &str, opts: &PackOptions) -> Result<(), Error> {
     let text = fs::read_to_string(manifest_path)?;
-    let specs = manifest::parse_manifest(&text)?;
+    let specs = parse_manifest(&text)?;
     println!("[*] Manifest: {} entries", specs.len());
 
     let mut input_total: u64 = 0;
@@ -1094,6 +1122,7 @@ pub fn pack(manifest_path: &str, out_path: &str, opts: &PackOptions) -> Result<(
 ///
 /// The payload is a regular single-file UCOMP01 image (full pipeline with
 /// ELF chunking); unpacking is uniform with multi-file archives.
+#[cfg(feature = "compress")]
 pub fn pack_single(
     in_path: &str,
     out_path: &str,

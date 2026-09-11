@@ -39,6 +39,7 @@ impl FileMeta {
         Self::default()
     }
 
+# [cfg(feature = "compress")]
     pub fn is_empty(&self) -> bool {
         self.mode.is_none()
             && self.uid.is_none()
@@ -47,6 +48,7 @@ impl FileMeta {
     }
 
     /// Override every `Some` field of `forced` over `self`.
+# [cfg(feature = "compress")]
     pub fn apply_forced(&mut self, forced: &FileMeta) {
         if forced.mode.is_some() {
             self.mode = forced.mode;
@@ -65,12 +67,14 @@ impl FileMeta {
 
 /// Which fields to read from the filesystem.
 #[derive(Debug, Clone, Copy, Default)]
+# [cfg(feature = "compress")]
 pub struct Preserve {
     pub perms: bool,
     pub owner: bool,
     pub context: bool,
 }
 
+# [cfg(feature = "compress")]
 impl Preserve {
     pub fn any(self) -> bool {
         self.perms || self.owner || self.context
@@ -78,6 +82,7 @@ impl Preserve {
 }
 
 /// Parse permission bits: `755`, `0755`, `4755` or `rwxr-xr-x`.
+#[cfg(any(feature = "compress", test))]
 pub fn parse_mode(s: &str) -> Result<u32, Error> {
     if !s.is_empty() && s.chars().all(|c| ('0'..='7').contains(&c)) && (3..=4).contains(&s.len())
     {
@@ -127,6 +132,7 @@ pub fn format_mode_symbolic(mode: u32) -> String {
     s
 }
 
+#[cfg(any(feature = "compress", test))]
 fn resolve_user(name: &str) -> Result<u32, Error> {
     let cname =
         CString::new(name).map_err(|_| Error::Meta(format!("bad user name: {name}")))?;
@@ -143,6 +149,7 @@ fn resolve_user(name: &str) -> Result<u32, Error> {
     }
 }
 
+#[cfg(any(feature = "compress", test))]
 fn resolve_group(name: &str) -> Result<u32, Error> {
     let cname =
         CString::new(name).map_err(|_| Error::Meta(format!("bad group name: {name}")))?;
@@ -158,6 +165,7 @@ fn resolve_group(name: &str) -> Result<u32, Error> {
     }
 }
 
+#[cfg(any(feature = "compress", test))]
 fn parse_id_or_name(s: &str, resolve: fn(&str) -> Result<u32, Error>) -> Result<u32, Error> {
     if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
         s.parse::<u32>()
@@ -170,6 +178,7 @@ fn parse_id_or_name(s: &str, resolve: fn(&str) -> Result<u32, Error>) -> Result<
 /// Parse owner: `user`, `uid`, `user:group`, `uid:gid` (mixed forms allowed).
 ///
 /// Returns `(uid, gid)` where each side is `None` when omitted.
+#[cfg(any(feature = "compress", test))]
 pub fn parse_owner(s: &str) -> Result<(Option<u32>, Option<u32>), Error> {
     if s.is_empty() || s == "-" {
         return Err(Error::Meta("empty owner spec".to_string()));
@@ -200,6 +209,7 @@ pub fn format_owner(uid: u32, gid: u32) -> String {
 }
 
 /// Parse SELinux context: any non-empty string without NUL bytes.
+#[cfg(feature = "compress")]
 pub fn parse_context(s: &str) -> Result<String, Error> {
     if s.is_empty() || s.bytes().any(|b| b == 0) {
         return Err(Error::Meta(format!("bad SELinux context: {s}")));
@@ -215,6 +225,7 @@ fn c_path(path: &Path) -> Result<CString, Error> {
 /// Read the `security.selinux` xattr without following symlinks.
 ///
 /// Returns `Ok(None)` when the filesystem entry has no context stored.
+# [cfg(feature = "compress")]
 fn read_context(path: &Path) -> Result<Option<String>, Error> {
     let cpath = c_path(path)?;
     let attr = CString::new("security.selinux").unwrap();
@@ -258,6 +269,7 @@ fn read_context(path: &Path) -> Result<Option<String>, Error> {
 
 /// Fill the missing fields of `meta` from the filesystem (no symlink
 /// following: a symlink contributes its own `lstat` data).
+# [cfg(feature = "compress")]
 pub fn fill_preserve(meta: &mut FileMeta, path: &Path, preserve: Preserve) -> Result<(), Error> {
     if !preserve.any() {
         return Ok(());

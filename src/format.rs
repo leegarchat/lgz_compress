@@ -45,10 +45,12 @@ pub const CHUNK_HDR_LEN: usize = 9;
 /// Same 256 MiB output cap as the C decoder.
 pub const MAX_OUTPUT: u64 = 256 * 1024 * 1024;
 
+#[cfg(feature = "compress")]
 pub fn write_u32le(buf: &mut [u8], v: u32) {
     buf[0..4].copy_from_slice(&v.to_le_bytes());
 }
 
+#[cfg(feature = "compress")]
 pub fn write_u64le(buf: &mut [u8], v: u64) {
     buf[0..8].copy_from_slice(&v.to_le_bytes());
 }
@@ -82,6 +84,7 @@ pub struct ArchiveHeader {
 }
 
 /// Serialize the archive header (magic + sizes + per-chunk records).
+#[cfg(feature = "compress")]
 pub fn encode_header(orig_size: u64, metas: &[ChunkMeta]) -> Vec<u8> {
     let mut hdr = vec![0u8; HEADER_LEN + metas.len() * CHUNK_HDR_LEN];
     hdr[0..8].copy_from_slice(MAGIC);

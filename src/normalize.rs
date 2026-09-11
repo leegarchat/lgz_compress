@@ -10,6 +10,7 @@
 ///
 /// Processes 4-byte little-endian instructions:
 /// `B`/`BL` (opcode_top 0x05/0x25), `ADRP` (mask 0x9F000000 == 0x90000000).
+#[cfg(any(feature = "compress", test))]
 pub fn arm64_normalize(data: &mut [u8]) {
     let size = data.len();
     let mut i = 0;
@@ -90,6 +91,7 @@ pub fn arm64_denormalize(data: &mut [u8]) {
 }
 
 /// x86: `E8`/`E9 rel32` -> absolute target address.
+#[cfg(any(feature = "compress", test))]
 pub fn x86_normalize(data: &mut [u8]) {
     let size = data.len();
     let mut i = 0;

@@ -12,7 +12,9 @@
 //! - UCOMP02: multi-file container (entry tree + metadata + one solid
 //!   UCOMP01 blob shared by all files).
 
+#[cfg(feature = "compress")]
 mod chunk;
+#[cfg(feature = "compress")]
 mod compress;
 mod decompress;
 mod delta;
@@ -31,6 +33,7 @@ use std::process::ExitCode;
 
 use error::Error;
 use meta::MetaFilter;
+#[cfg(feature = "compress")]
 use pack::PackOptions;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -38,8 +41,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 fn print_global_help(program: &str) {
     println!(
         "lgz_compress {VERSION} — low-level binary compression utility (ARM64-oriented)
-Single-file archives (UCOMP01) are payload-compatible with the C version.
-
+Single-file archives (UCOMP01) are payload-compatible with the C version."
+    );
+    #[cfg(feature = "compress")]
+    println!(
+        "
 Usage:
   {program} <command> [arguments] [options]
 
@@ -51,13 +57,31 @@ Commands:
                                       (solid cluster: one shared LZMA2 stream).
   decompress <archive> [dest]         Unpack. UCOMP01 needs <dest> file path.
                                       UCOMP02 unpacks the tree into [dest] dir
-                                      (default: current directory).
-  list <archive>  (alias: ls)         Show archive contents without unpacking.
+                                      (default: current directory)."
+    );
+    #[cfg(not(feature = "compress"))]
+    println!(
+        "
+Decompress-only build: compression commands are not compiled in.
+
+Usage:
+  {program} <command> [arguments] [options]
+
+Commands:
+  decompress <archive> [dest]         Unpack. UCOMP01 needs <dest> file path.
+                                      UCOMP02 unpacks the tree into [dest] dir
+                                      (default: current directory)."
+    );
+    println!(
+        "  list <archive>  (alias: ls)         Show archive contents without unpacking.
   extract <archive> <file> [dest]     Pull one entry out of a UCOMP02 archive
                       (alias: x)      (structure kept, or --flatten).
   help [command]                      Show this help or command help.
-  --version, -V                       Print version.
-
+  --version, -V                       Print version."
+    );
+    #[cfg(feature = "compress")]
+    println!(
+        "
 Options (compress, pack):
   -l, --level <0-3>        Optimization level (default 2):
                              0 = fast, 1 = balanced,
@@ -80,8 +104,10 @@ Options (compress, pack):
 
 Precedence for metadata: --chmod/--owner/--context override everything,
 manifest line values are used as written, --preserve-* fills the rest.
-By default nothing is stored.
-
+By default nothing is stored."
+    );
+    println!(
+        "
 Options (decompress, extract — which stored metadata to restore):
   (default: restore everything stored)
   --no-meta, --skip-meta           Restore nothing at all.
@@ -92,8 +118,11 @@ Options (decompress, extract — which stored metadata to restore):
   --preserve-owner                 Restore only uid/gid.
   --preserve-context               Restore only SELinux contexts.
   --preserve-all                   Restore everything stored (default).
-  (extract only: --flatten, --strip-path, -f — drop archived paths.)
-
+  (extract only: --flatten, --strip-path, -f — drop archived paths.)"
+    );
+    #[cfg(feature = "compress")]
+    println!(
+        "
 Examples:
   {program} compress app_process64 app.lgz 2
   {program} compress --level 0 --preserve-all linker64 linker64.lgz
@@ -104,10 +133,22 @@ Examples:
 Exit codes: 0 = ok, 1 = error. Metadata apply failures (chown/xattr
 without privileges) are warnings, not errors."
     );
+    #[cfg(not(feature = "compress"))]
+    println!(
+        "
+Examples:
+  {program} decompress system.lgz /tmp/restore
+  {program} list system.lgz
+  {program} extract system.lgz bin/toybox /tmp/out --flatten
+
+Exit codes: 0 = ok, 1 = error. Metadata apply failures (chown/xattr
+without privileges) are warnings, not errors."
+    );
 }
 
 fn print_command_help(program: &str, cmd: &str) {
     match cmd {
+        #[cfg(feature = "compress")]
         "compress" => println!(
             "Usage: {program} compress <input> <output> [level] [options]
 
@@ -124,6 +165,7 @@ Examples:
   {program} compress app_process64 app.lgz 2
   {program} compress -l 0 --preserve-perms --preserve-context f f.lgz"
         ),
+        #[cfg(feature = "compress")]
         "pack" => println!(
             "Usage: {program} pack <manifest> <output> [options]
 
@@ -227,6 +269,7 @@ Example:
 ///
 /// Returns `(positionals, level, threads, pack_options)` where `threads`
 /// is `None` when the flag was not given (all cores are used).
+#[cfg(feature = "compress")]
 fn parse_common(
     args: &[String],
 ) -> Result<(Vec<String>, Option<u8>, Option<usize>, PackOptions), Error> {
@@ -306,6 +349,7 @@ fn parse_common(
     Ok((positionals, level, threads, opts))
 }
 
+#[cfg(feature = "compress")]
 fn cmd_compress(program: &str, args: &[String]) -> Result<(), Error> {
     let (pos, flag_level, flag_threads, opts) = parse_common(args)?;
     if pos.len() < 2 || pos.len() > 3 {
@@ -347,6 +391,7 @@ fn cmd_compress(program: &str, args: &[String]) -> Result<(), Error> {
     }
 }
 
+#[cfg(feature = "compress")]
 fn cmd_pack(program: &str, args: &[String]) -> Result<(), Error> {
     let (pos, flag_level, flag_threads, opts) = parse_common(args)?;
     if pos.len() != 2 {
@@ -481,7 +526,9 @@ fn main() -> ExitCode {
             }
             return ExitCode::SUCCESS;
         }
+        #[cfg(feature = "compress")]
         Some("compress") => cmd_compress(program, &args[1..]),
+        #[cfg(feature = "compress")]
         Some("pack") => cmd_pack(program, &args[1..]),
         Some("decompress") => cmd_decompress(program, &args[1..]),
         Some("list") | Some("ls") => cmd_list(program, &args[1..]),

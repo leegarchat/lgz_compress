@@ -5,6 +5,7 @@
 //! A tail that is not a multiple of 4 is copied as is.
 
 /// Pack instructions into 4 planes (+ tail).
+#[cfg(feature = "compress")]
 pub fn encode(data: &[u8]) -> Vec<u8> {
     let size = data.len();
     let n_instr = size / 4;
