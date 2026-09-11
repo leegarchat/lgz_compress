@@ -1,0 +1,22 @@
+[package]
+name = "lgz_compress"
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "lgz_compress — low-level standalone binary compression utility, arm64-oriented static musl builds"
+repository = "https://github.com/anomalyco/opencode"
+
+[[bin]]
+name = "lgz_compress"
+path = "src/main.rs"
+
+[dependencies]
+lzma-rust2 = "0.20"
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
