@@ -15,14 +15,6 @@ use crate::error::Error;
 use crate::format;
 use crate::{delta, lzma, normalize, planes};
 
-/// Undo preprocessing of type 7: un-plane, then ARM64 branch
-/// denormalization (same as type 1 but without the delta layer).
-fn undo_type7(payload: Vec<u8>) -> Result<Vec<u8>, Error> {
-    let mut out = planes::decode(&payload);
-    normalize::arm64_denormalize(&mut out);
-    Ok(out)
-}
-
 /// Undo preprocessing of type 1: per-plane delta decode, un-plane,
 /// then ARM64 branch denormalization.
 fn undo_type1(payload: Vec<u8>) -> Result<Vec<u8>, Error> {
@@ -38,19 +30,6 @@ fn undo_type1(payload: Vec<u8>) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
-/// Undo preprocessing of type 8 on one code section: un-plane (in place),
-/// then branch denormalization. Same as the type 4 section path but
-/// without the delta layer.
-fn undo_planes_blob_section(buf: &mut [u8], arch: Arch) {
-    match arch {
-        Arch::Arm64 => {
-            let unplaned = planes::decode(buf);
-            buf.copy_from_slice(&unplaned);
-            normalize::arm64_denormalize(buf);
-        }
-        Arch::X86 => normalize::x86_denormalize(buf),
-    }
-}
 /// Undo preprocessing of type 4 on one code section: per-plane delta
 /// decode, un-plane (in place), then branch denormalization.
 /// On x86 it is a plain branch denormalization.
@@ -93,7 +72,6 @@ fn undo_preproc(mut payload: Vec<u8>, preproc: u8) -> Result<Vec<u8>, Error> {
     match preproc {
         0 => Ok(payload),
         1 => undo_type1(payload),
-        7 => undo_type7(payload),
         2 | 5 => {
             delta::decode(&mut payload);
             Ok(payload)
@@ -122,23 +100,6 @@ fn undo_preproc(mut payload: Vec<u8>, preproc: u8) -> Result<Vec<u8>, Error> {
         6 => {
             delta::decode(&mut payload);
             denormalize_blob_sections(&mut payload);
-            Ok(payload)
-        }
-        8 => {
-            if let Some(info) = elf::parse(&payload) {
-                // Collect ranges first: `elf::parse` borrows `payload`.
-                let ranges: Vec<(usize, usize, Arch)> = info
-                    .sections
-                    .iter()
-                    .filter(|s| s.is_code)
-                    .map(|s| (s.offset as usize, s.size as usize, info.arch))
-                    .collect();
-                for (off, size, arch) in ranges {
-                    if off + size <= payload.len() {
-                        undo_planes_blob_section(&mut payload[off..off + size], arch);
-                    }
-                }
-            }
             Ok(payload)
         }
         _ => Err(Error::BadArchive(format!(
@@ -189,59 +150,19 @@ pub fn decompress_file(in_path: &str, out_path: &str) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::ChunkMeta;
 
-    /// End-to-end check of preprocessing type 7 (ARM64 planes, no delta):
-    /// build a one-chunk archive by hand and decode it back.
+    /// Sanity: a plain (type 0) chunk round-trips through the header codec.
     #[test]
-    fn type7_roundtrip() {
-        // 8 ARM64 instructions: BL, B, ADRP, NOP, MOV, RET, LDR, ADD.
-        let orig: Vec<u8> = vec![
-            0x00, 0x04, 0x00, 0x94, // BL
-            0x00, 0x08, 0x00, 0x14, // B
-            0x00, 0x00, 0x00, 0x90, // ADRP
-            0x1F, 0x20, 0x03, 0xD5, // NOP
-            0xE0, 0x03, 0x00, 0xAA, // MOV
-            0xC0, 0x03, 0x5F, 0xD6, // RET
-            0x02, 0x00, 0x40, 0xF9, // LDR
-            0x00, 0x04, 0x00, 0x91, // ADD
-        ];
-        let mut norm = orig.clone();
-        normalize::arm64_normalize(&mut norm);
-        let planed = planes::encode(&norm);
-        let comp = lzma::compress_buf(&planed, 0, 0, 0, 1).unwrap();
-        let meta = ChunkMeta {
-            preproc: 7,
+    fn plain_chunk_roundtrip() {
+        let orig: Vec<u8> = (0..256).map(|i| (i * 7 + 3) as u8).collect();
+        let comp = lzma::compress_buf(&orig, 3, 0, 2, 1).unwrap();
+        let meta = crate::format::ChunkMeta {
+            preproc: 0,
             orig_size: orig.len() as u32,
             comp_size: comp.len() as u32,
         };
         let mut img = format::encode_header(orig.len() as u64, &[meta]);
         img.extend_from_slice(&comp);
         assert_eq!(decompress_bytes(&img).unwrap(), orig);
-    }
-
-    /// Type 8 section path (planes without delta): normalize + plane-split
-    /// a buffer, then invert it exactly like the unpacker does per section.
-    #[test]
-    fn type8_section_roundtrip() {
-        let mut orig: Vec<u8> = vec![
-            0x00, 0x04, 0x00, 0x94, // BL
-            0x00, 0x00, 0x00, 0x90, // ADRP
-            0x02, 0x00, 0x40, 0xF9, // LDR literal
-            0x40, 0x00, 0x00, 0x34, // CBZ
-            0x1F, 0x20, 0x03, 0xD5, // NOP
-            0xC0, 0x03, 0x5F, 0xD6, // RET
-        ];
-        // Odd tail must survive untouched.
-        orig.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
-
-        let mut packed = orig.clone();
-        normalize::arm64_normalize(&mut packed[..24]);
-        let planed = planes::encode(&packed[..24]);
-        packed[..24].copy_from_slice(&planed);
-
-        let mut out = packed.clone();
-        undo_planes_blob_section(&mut out[..24], Arch::Arm64);
-        assert_eq!(out, orig);
     }
 }
