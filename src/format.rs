@@ -20,6 +20,8 @@
 //! - 4 = blob: branch normalize + in-place planes + delta
 //! - 5 = blob: whole-file delta
 //! - 6 = blob: branch normalize + whole-file delta
+//! - 7 = chunk: arm64 planes, no delta (Rust only; the C tool and older
+//!   Rust binaries cannot decode chunks of this type)
 
 use crate::error::Error;
 
@@ -120,7 +122,7 @@ pub fn parse_header(data: &[u8]) -> Result<ArchiveHeader, Error> {
     for i in 0..n_chunks {
         let base = HEADER_LEN + i * CHUNK_HDR_LEN;
         let preproc = data[base];
-        if preproc > 6 {
+        if preproc > 7 {
             return Err(Error::BadArchive(format!(
                 "chunk {i}: bad preproc type {preproc}"
             )));

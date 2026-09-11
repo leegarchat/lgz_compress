@@ -131,6 +131,9 @@ Unpack an archive, auto-detected by magic:
                          missing, default: current directory). The stored
                          tree (dirs, files, symlinks) is recreated inside,
                          stored metadata is applied (failures are warnings).
+                         Writes never traverse symlinks (Zip-Slip guard).
+Note: files packed with preprocessing type 7 (planes without delta)
+need this Rust tool; the C tool cannot decode them.
 
 Examples:
   {program} decompress app.lgz app.out

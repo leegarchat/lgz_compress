@@ -15,6 +15,14 @@ use crate::error::Error;
 use crate::format;
 use crate::{delta, lzma, normalize, planes};
 
+/// Undo preprocessing of type 7: un-plane, then ARM64 branch
+/// denormalization (same as type 1 but without the delta layer).
+fn undo_type7(payload: Vec<u8>) -> Result<Vec<u8>, Error> {
+    let mut out = planes::decode(&payload);
+    normalize::arm64_denormalize(&mut out);
+    Ok(out)
+}
+
 /// Undo preprocessing of type 1: per-plane delta decode, un-plane,
 /// then ARM64 branch denormalization.
 fn undo_type1(payload: Vec<u8>) -> Result<Vec<u8>, Error> {
@@ -72,6 +80,7 @@ fn undo_preproc(mut payload: Vec<u8>, preproc: u8) -> Result<Vec<u8>, Error> {
     match preproc {
         0 => Ok(payload),
         1 => undo_type1(payload),
+        7 => undo_type7(payload),
         2 | 5 => {
             delta::decode(&mut payload);
             Ok(payload)
@@ -145,4 +154,39 @@ pub fn decompress_file(in_path: &str, out_path: &str) -> Result<(), Error> {
     fs::write(out_path, &output)?;
     println!("[+] Decompressed OK: {} bytes", output.len());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::ChunkMeta;
+
+    /// End-to-end check of preprocessing type 7 (ARM64 planes, no delta):
+    /// build a one-chunk archive by hand and decode it back.
+    #[test]
+    fn type7_roundtrip() {
+        // 8 ARM64 instructions: BL, B, ADRP, NOP, MOV, RET, LDR, ADD.
+        let orig: Vec<u8> = vec![
+            0x00, 0x04, 0x00, 0x94, // BL
+            0x00, 0x08, 0x00, 0x14, // B
+            0x00, 0x00, 0x00, 0x90, // ADRP
+            0x1F, 0x20, 0x03, 0xD5, // NOP
+            0xE0, 0x03, 0x00, 0xAA, // MOV
+            0xC0, 0x03, 0x5F, 0xD6, // RET
+            0x02, 0x00, 0x40, 0xF9, // LDR
+            0x00, 0x04, 0x00, 0x91, // ADD
+        ];
+        let mut norm = orig.clone();
+        normalize::arm64_normalize(&mut norm);
+        let planed = planes::encode(&norm);
+        let comp = lzma::compress_buf(&planed, 0, 0, 0, 1).unwrap();
+        let meta = ChunkMeta {
+            preproc: 7,
+            orig_size: orig.len() as u32,
+            comp_size: comp.len() as u32,
+        };
+        let mut img = format::encode_header(orig.len() as u64, &[meta]);
+        img.extend_from_slice(&comp);
+        assert_eq!(decompress_bytes(&img).unwrap(), orig);
+    }
 }

@@ -1,13 +1,18 @@
 //! Per-chunk best-of preprocessing selection.
 //!
-//! Direct port of `compress_chunk_best` from lgzv3.c. Every candidate is
-//! LZMA2-compressed and the smallest payload wins (strictly smaller keeps
-//! the earlier candidate, as in C):
+//! Direct port of `compress_chunk_best` from lgzv3.c, plus one extra
+//! candidate the C version lacks: ARM64 planes WITHOUT delta (type 7).
+//! Delta coding breaks opcode periodicity in machine code, so on heavy
+//! .so/.text sections pure plane splitting can win 1-2% over planes+delta.
+//! Every candidate is LZMA2-compressed and the smallest payload wins
+//! (strictly smaller keeps the earlier candidate, as in C):
 //! - (lc=3, lp=0, pb=2) on raw data, always;
 //! - (lc=2, lp=2, pb=2) on raw data, unless level 0;
 //! - ARM64 code chunks >= 16 bytes: branch normalize -> planes ->
-//!   per-plane delta -> (lc=0, lp=0, pb=0);
-//! - chunks >= 4 bytes: whole-buffer delta -> (lc=0, lp=0, pb=0).
+//!   per-plane delta -> (lc=0, lp=0, pb=0) [type 1];
+//! - ARM64 code chunks >= 16 bytes: branch normalize -> planes,
+//!   no delta -> (lc=0, lp=0, pb=0) [type 7];
+//! - chunks >= 4 bytes: whole-buffer delta -> (lc=0, lp=0, pb=0) [type 2].
 
 use crate::elf::Arch;
 use crate::error::Error;
@@ -62,21 +67,27 @@ pub fn compress_chunk_best(
     consider(0, c);
 
     // Candidate 3: ARM64 code -> normalize + planes + per-plane delta.
+    // Candidate 4: ARM64 code -> normalize + planes, no delta (type 7).
     if is_code && arch == Some(Arch::Arm64) && data.len() >= 16 {
         let mut tmp = data.to_vec();
         normalize::arm64_normalize(&mut tmp);
-        let mut planed = planes::encode(&tmp);
+        let planed = planes::encode(&tmp);
+
+        let mut planed_delta = planed.clone();
         let n_instr = data.len() / 4;
         if n_instr > 1 {
             for p in 0..4 {
-                delta::encode(&mut planed[p * n_instr..(p + 1) * n_instr]);
+                delta::encode(&mut planed_delta[p * n_instr..(p + 1) * n_instr]);
             }
         }
-        let c = lzma::compress_buf(&planed, 0, 0, 0, opt_level)?;
+        let c = lzma::compress_buf(&planed_delta, 0, 0, 0, opt_level)?;
         consider(1, c);
+
+        let c = lzma::compress_buf(&planed, 0, 0, 0, opt_level)?;
+        consider(7, c);
     }
 
-    // Candidate 4: whole-buffer delta.
+    // Candidate 5: whole-buffer delta.
     if data.len() >= 4 {
         let mut tmp = data.to_vec();
         delta::encode(&mut tmp);

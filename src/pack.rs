@@ -3,7 +3,9 @@
 //! Many files (a whole tree) are packed into ONE archive:
 //! 1. every regular file is branch-normalized individually (ELF code
 //!    sections; the ranges are stored so unpacking can invert it),
-//! 2. normalized contents are concatenated into one solid blob,
+//! 2. normalized contents are concatenated into one solid blob, each file
+//!    starting at a 4-byte boundary (keeps LZMA pos_state aligned with
+//!    ARM64 opcodes across files),
 //! 3. the solid blob is compressed once with the full single-file pipeline
 //!    ([`compress_data`]), so the LZMA2 dictionary spans file boundaries
 //!    and the optimizer runs once instead of once per file,
@@ -34,7 +36,9 @@
 //! ranges). Unpacking is uniform for both cases.
 
 use std::fs;
+use std::io::{self, Write};
 use std::ops::Range;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::compress::{self, Chunk};
@@ -434,6 +438,12 @@ fn resolve_entry(
             let raw = fs::read(fs_path)?;
             *input_total += raw.len() as u64;
             let (blob, ranges) = normalize_for_solid(&raw);
+            // Keep every file 4-byte aligned in the solid blob: LZMA
+            // pos_state (pb=2) keys literal contexts by position % 4, so a
+            // misaligned file would skew opcode statistics for all ARM64
+            // code packed after it.
+            let pad = (4 - (solid.len() % 4)) % 4;
+            solid.resize(solid.len() + pad, 0);
             let off = solid.len() as u64;
             let size = blob.len() as u64;
             solid.extend_from_slice(&blob);
@@ -634,11 +644,77 @@ fn denormalize_file(buf: &mut [u8], ranges: &[CodeRange]) -> Result<(), Error> {
     Ok(())
 }
 
+/// Create directories component by component, refusing to traverse
+/// symlinks (Zip-Slip guard: a malicious/absent-minded archive must not
+/// redirect `dest/a/b` through a planted `dest/a -> /somewhere` link).
+fn safe_mkdir_all(dest: &Path, rel: &Path) -> Result<(), Error> {
+    let mut cur = PathBuf::from(dest);
+    for comp in rel.components() {
+        let name = match comp {
+            Component::Normal(s) => s,
+            Component::CurDir => continue,
+            _ => {
+                return Err(Error::BadArchive(format!(
+                    "unsafe path component in '{}'",
+                    rel.display()
+                )));
+            }
+        };
+        cur.push(name);
+        match fs::symlink_metadata(&cur) {
+            Ok(st) => {
+                if st.file_type().is_symlink() {
+                    return Err(Error::BadArchive(format!(
+                        "refusing to traverse symlink: '{}'",
+                        cur.display()
+                    )));
+                }
+                if !st.file_type().is_dir() {
+                    return Err(Error::BadArchive(format!(
+                        "not a directory: '{}'",
+                        cur.display()
+                    )));
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => fs::create_dir(&cur)?,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Write file bytes, refusing to follow a trailing symlink (O_NOFOLLOW).
+fn safe_write_file(full: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(full)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                Error::BadArchive(format!(
+                    "refusing to write through symlink: '{}'",
+                    full.display()
+                ))
+            } else {
+                Error::Io(e)
+            }
+        })?;
+    f.write_all(bytes)?;
+    Ok(())
+}
+
 /// Unpack a UCOMP02 archive into `dest_dir` (created when missing).
+///
+/// Order matters for safety: directories first, then files, then symlinks,
+/// metadata last. Nothing is ever written through a symlink planted by an
+/// earlier entry (absolute link targets like `/apex/...` are still honored
+/// as links, they just cannot redirect file writes).
 pub fn unpack(arc_path: &str, dest_dir: &str) -> Result<(), Error> {
     let data = fs::read(arc_path)?;
     let (entries, solid_range) = parse_container(&data)?;
-    let solid = decompress::decompress_bytes(&data[solid_range])?;
+    let mut solid = decompress::decompress_bytes(&data[solid_range])?;
     println!(
         "[*] Unpacking {} entries to {dest_dir} (solid: {} bytes)",
         entries.len(),
@@ -648,57 +724,65 @@ pub fn unpack(arc_path: &str, dest_dir: &str) -> Result<(), Error> {
     let dest = Path::new(dest_dir);
     fs::create_dir_all(dest)?;
 
-    // Phase 1: directories (explicit + parents), then files and symlinks.
     let mut full_paths: Vec<PathBuf> = Vec::with_capacity(entries.len());
     for e in &entries {
-        let full = safe_join(dest, &e.path)?;
-        match e.kind {
-            EntryKind::Dir => fs::create_dir_all(&full)?,
-            EntryKind::File => {
-                if let Some(parent) = full.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-            }
-            EntryKind::Link => {
-                if let Some(parent) = full.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-            }
-        }
-        full_paths.push(full);
+        full_paths.push(safe_join(dest, &e.path)?);
     }
+
+    // Phase 1: directories (explicit + parents of files/links).
     for (e, full) in entries.iter().zip(full_paths.iter()) {
+        let rel = Path::new(&e.path);
         match e.kind {
-            EntryKind::Dir => {}
-            EntryKind::File => {
-                let end = e.solid_off.checked_add(e.solid_size).ok_or_else(|| {
-                    Error::BadArchive(format!("bad solid range for '{}'", e.path))
-                })?;
-                if end > solid.len() as u64 {
-                    return Err(Error::BadArchive(format!(
-                        "solid range outside blob for '{}'",
-                        e.path
-                    )));
-                }
-                let mut bytes = solid[e.solid_off as usize..end as usize].to_vec();
-                denormalize_file(&mut bytes, &e.code_ranges)?;
-                fs::write(full, &bytes)?;
-            }
-            EntryKind::Link => {
-                let target = e.link_target.as_deref().unwrap_or("");
-                if fs::symlink_metadata(full).is_ok() {
-                    let st = fs::symlink_metadata(full)?;
-                    if st.file_type().is_dir() && !st.file_type().is_symlink() {
-                        return Err(Error::Meta(format!(
-                            "cannot replace directory with symlink: '{}'",
-                            e.path
-                        )));
+            EntryKind::Dir => safe_mkdir_all(dest, rel)?,
+            EntryKind::File | EntryKind::Link => {
+                if let Some(parent) = rel.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        safe_mkdir_all(dest, parent)?;
                     }
-                    fs::remove_file(full)?;
                 }
-                std::os::unix::fs::symlink(target, full)?;
+                let _ = full;
             }
         }
+    }
+
+    // Phase 2: files. Denormalization runs in place on the solid slice,
+    // so no per-file copy is allocated (the solid is already in RAM).
+    for (e, full) in entries.iter().zip(full_paths.iter()) {
+        if e.kind != EntryKind::File {
+            continue;
+        }
+        let end = e.solid_off.checked_add(e.solid_size).ok_or_else(|| {
+            Error::BadArchive(format!("bad solid range for '{}'", e.path))
+        })?;
+        if end > solid.len() as u64 {
+            return Err(Error::BadArchive(format!(
+                "solid range outside blob for '{}'",
+                e.path
+            )));
+        }
+        let range = e.solid_off as usize..end as usize;
+        denormalize_file(&mut solid[range.clone()], &e.code_ranges)?;
+        safe_write_file(full, &solid[range])?;
+    }
+
+    // Phase 3: symlinks (created last, so nothing can be written through
+    // them during this unpack).
+    for (e, full) in entries.iter().zip(full_paths.iter()) {
+        if e.kind != EntryKind::Link {
+            continue;
+        }
+        let target = e.link_target.as_deref().unwrap_or("");
+        if fs::symlink_metadata(full).is_ok() {
+            let st = fs::symlink_metadata(full)?;
+            if st.file_type().is_dir() && !st.file_type().is_symlink() {
+                return Err(Error::Meta(format!(
+                    "cannot replace directory with symlink: '{}'",
+                    e.path
+                )));
+            }
+            fs::remove_file(full)?;
+        }
+        std::os::unix::fs::symlink(target, full)?;
     }
 
     // Phase 2: metadata — files/links first, directories last so interim

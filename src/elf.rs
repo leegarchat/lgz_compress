@@ -30,7 +30,6 @@ pub struct ElfInfo {
     pub arch: Arch,
 }
 
-const EM_386: u16 = 3;
 const EM_X86_64: u16 = 62;
 const EM_AARCH64: u16 = 183;
 const SHF_EXECINSTR: u64 = 0x4;
@@ -71,9 +70,12 @@ pub fn parse(data: &[u8]) -> Option<ElfInfo> {
     if data[0..4] != [0x7f, b'E', b'L', b'F'] {
         return None;
     }
+    // NOTE: 32-bit x86 (EM_386) is intentionally unsupported: those files
+    // are ELFCLASS32 and are rejected by the class check below, exactly
+    // like the C version did.
     let arch = match u16le(data, 18) {
         EM_AARCH64 => Arch::Arm64,
-        EM_X86_64 | EM_386 => Arch::X86,
+        EM_X86_64 => Arch::X86,
         _ => return None,
     };
     // e_ident[EI_CLASS] == 2 (ELFCLASS64), as in C: `ehdr->e_ident[4] != 2`.
