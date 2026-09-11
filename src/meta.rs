@@ -114,6 +114,19 @@ pub fn format_mode(mode: u32) -> String {
     format!("{:o}", mode & 0o7777)
 }
 
+/// Format permission bits symbolically (`rwxr-xr-x`, 9 chars).
+pub fn format_mode_symbolic(mode: u32) -> String {
+    let mode = mode & 0o777;
+    let mut s = String::with_capacity(9);
+    for shift in [6, 3, 0] {
+        let bits = (mode >> shift) & 0o7;
+        s.push(if bits & 0o4 != 0 { 'r' } else { '-' });
+        s.push(if bits & 0o2 != 0 { 'w' } else { '-' });
+        s.push(if bits & 0o1 != 0 { 'x' } else { '-' });
+    }
+    s
+}
+
 fn resolve_user(name: &str) -> Result<u32, Error> {
     let cname =
         CString::new(name).map_err(|_| Error::Meta(format!("bad user name: {name}")))?;
@@ -267,23 +280,101 @@ pub fn fill_preserve(meta: &mut FileMeta, path: &Path, preserve: Preserve) -> Re
     Ok(())
 }
 
-/// Apply stored metadata to an unpacked path.
+/// Which stored metadata categories to apply on unpack/extract.
+///
+/// Default (no flags) is everything stored. `--no-*` subtracts, while any
+/// `--preserve-*` switches to whitelist mode (only the listed categories).
+#[derive(Debug, Clone, Copy)]
+pub struct MetaFilter {
+    /// Apply permission bits (chmod).
+    pub perms: bool,
+    /// Apply uid/gid (chown/lchown).
+    pub owner: bool,
+    /// Apply SELinux context (lsetxattr).
+    pub context: bool,
+}
+
+impl MetaFilter {
+    /// Restore everything stored (default behavior).
+    pub fn all() -> Self {
+        MetaFilter {
+            perms: true,
+            owner: true,
+            context: true,
+        }
+    }
+
+    /// Restore nothing (files get umask defaults and the current user).
+    pub fn none() -> Self {
+        MetaFilter {
+            perms: false,
+            owner: false,
+            context: false,
+        }
+    }
+
+    /// Resolve CLI selection: optional whitelist (`--preserve-*`, where
+    /// `--preserve-all` enables all three) minus blacklist (`--no-*`).
+    /// `white_all` = `--preserve-all` was given.
+    pub fn resolve(
+        white_perms: bool,
+        white_owner: bool,
+        white_context: bool,
+        white_all: bool,
+        no_perms: bool,
+        no_owner: bool,
+        no_context: bool,
+        no_all: bool,
+    ) -> Self {
+        if no_all {
+            return MetaFilter::none();
+        }
+        let mut f = if white_perms || white_owner || white_context || white_all {
+            MetaFilter {
+                perms: white_perms || white_all,
+                owner: white_owner || white_all,
+                context: white_context || white_all,
+            }
+        } else {
+            MetaFilter::all()
+        };
+        if no_perms {
+            f.perms = false;
+        }
+        if no_owner {
+            f.owner = false;
+        }
+        if no_context {
+            f.context = false;
+        }
+        f
+    }
+}
+
+/// Apply stored metadata, restricted to the categories in `filter`.
 ///
 /// `chmod` is skipped for symlinks (Linux symlinks are always 0777).
 /// Failures are collected as warnings; the caller prints them.
-pub fn apply(path: &Path, meta: &FileMeta, is_symlink: bool) -> Vec<String> {
+pub fn apply_filtered(
+    path: &Path,
+    meta: &FileMeta,
+    is_symlink: bool,
+    filter: &MetaFilter,
+) -> Vec<String> {
     let mut warnings = Vec::new();
     let what = path.display().to_string();
 
-    if let Some(mode) = meta.mode {
-        if !is_symlink {
-            if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(mode)) {
-                warnings.push(format!("chmod {what}: {e}"));
+    if filter.perms {
+        if let Some(mode) = meta.mode {
+            if !is_symlink {
+                if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(mode)) {
+                    warnings.push(format!("chmod {what}: {e}"));
+                }
             }
         }
     }
 
-    if meta.uid.is_some() || meta.gid.is_some() {
+    if filter.owner && (meta.uid.is_some() || meta.gid.is_some()) {
         let cpath = match c_path(path) {
             Ok(p) => p,
             Err(e) => {
@@ -311,26 +402,28 @@ pub fn apply(path: &Path, meta: &FileMeta, is_symlink: bool) -> Vec<String> {
         }
     }
 
-    if let Some(ctx) = &meta.context {
-        match (c_path(path), CString::new(ctx.as_str())) {
-            (Ok(cpath), Ok(cctx)) => {
-                let attr = CString::new("security.selinux").unwrap();
-                // SAFETY: pointers and length describe the context bytes.
-                let rc = unsafe {
-                    libc::lsetxattr(
-                        cpath.as_ptr(),
-                        attr.as_ptr(),
-                        cctx.as_ptr() as *const libc::c_void,
-                        ctx.len(),
-                        0,
-                    )
-                };
-                if rc != 0 {
-                    let errno = unsafe { *libc::__errno_location() };
-                    warnings.push(format!("setxattr {what}: errno {errno}"));
+    if filter.context {
+        if let Some(ctx) = &meta.context {
+            match (c_path(path), CString::new(ctx.as_str())) {
+                (Ok(cpath), Ok(cctx)) => {
+                    let attr = CString::new("security.selinux").unwrap();
+                    // SAFETY: pointers and length describe the context bytes.
+                    let rc = unsafe {
+                        libc::lsetxattr(
+                            cpath.as_ptr(),
+                            attr.as_ptr(),
+                            cctx.as_ptr() as *const libc::c_void,
+                            ctx.len(),
+                            0,
+                        )
+                    };
+                    if rc != 0 {
+                        let errno = unsafe { *libc::__errno_location() };
+                        warnings.push(format!("setxattr {what}: errno {errno}"));
+                    }
                 }
+                _ => warnings.push(format!("setxattr {what}: bad path or context")),
             }
-            _ => warnings.push(format!("setxattr {what}: bad path or context")),
         }
     }
 

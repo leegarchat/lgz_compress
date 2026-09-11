@@ -19,6 +19,7 @@ mod delta;
 mod elf;
 mod error;
 mod format;
+mod inspect;
 mod lzma;
 mod manifest;
 mod meta;
@@ -29,6 +30,7 @@ mod planes;
 use std::process::ExitCode;
 
 use error::Error;
+use meta::MetaFilter;
 use pack::PackOptions;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -50,6 +52,9 @@ Commands:
   decompress <archive> [dest]         Unpack. UCOMP01 needs <dest> file path.
                                       UCOMP02 unpacks the tree into [dest] dir
                                       (default: current directory).
+  list <archive>  (alias: ls)         Show archive contents without unpacking.
+  extract <archive> <file> [dest]     Pull one entry out of a UCOMP02 archive
+                      (alias: x)      (structure kept, or --flatten).
   help [command]                      Show this help or command help.
   --version, -V                       Print version.
 
@@ -76,6 +81,18 @@ Options (compress, pack):
 Precedence for metadata: --chmod/--owner/--context override everything,
 manifest line values are used as written, --preserve-* fills the rest.
 By default nothing is stored.
+
+Options (decompress, extract — which stored metadata to restore):
+  (default: restore everything stored)
+  --no-meta, --skip-meta           Restore nothing at all.
+  --no-perms, --skip-perms         Skip chmod.
+  --no-owner, --skip-owner         Skip chown (no superuser warnings).
+  --no-context, --skip-context     Skip SELinux xattrs.
+  --preserve-perms                 Restore only permission bits.
+  --preserve-owner                 Restore only uid/gid.
+  --preserve-context               Restore only SELinux contexts.
+  --preserve-all                   Restore everything stored (default).
+  (extract only: --flatten, --strip-path, -f — drop archived paths.)
 
 Examples:
   {program} compress app_process64 app.lgz 2
@@ -136,7 +153,45 @@ Unpack an archive, auto-detected by magic:
 Examples:
   {program} decompress app.lgz app.out
   {program} decompress system.lgz /tmp/restore
-  {program} decompress system.lgz"
+  {program} decompress system.lgz
+  {program} decompress system.lgz /tmp/restore --no-owner --no-context
+
+Which stored metadata to restore (default: everything stored):
+  --no-meta / --skip-meta, --no-perms / --skip-perms,
+  --no-owner / --skip-owner, --no-context / --skip-context,
+  --preserve-perms, --preserve-owner, --preserve-context, --preserve-all"
+        ),
+        "list" | "ls" => println!(
+            "Usage: {program} list <archive.lgz>   (alias: ls)
+
+Show archive contents without unpacking (the solid payload is never
+decompressed). UCOMP02 prints one row per entry (type, perms, owner,
+SELinux context, size, path) plus a footer with counts and the total
+compression ratio. UCOMP01 prints the single file size, chunk count
+and preprocessing types."
+        ),
+        "extract" | "x" => println!(
+            "Usage: {program} extract <archive.lgz> <target_file> [destination] [options]
+  (alias: x)
+
+Pull one entry out of a UCOMP02 archive. The whole solid blob is
+decoded (inherent to the solid format), then only the requested range
+is written. Zip-Slip guards apply: no writes through symlinks.
+
+  <target_file>  Exact archived path, e.g. bin/toybox.
+  [destination]  Existing directory (or a path ending with /): place
+                 inside, keeping archived structure, or only the file
+                 name with --flatten. Otherwise it names the output
+                 file itself (missing parents are created).
+  -f, --flatten, --strip-path
+                 Drop archived directories, write just the file name.
+
+Same --no-* / --preserve-* metadata flags as decompress.
+
+Examples:
+  {program} extract system.lgz bin/toybox /tmp/out
+  {program} extract system.lgz bin/toybox /tmp/out --flatten
+  {program} x system.lgz bin/lib.so ./lib.so --no-owner --no-context"
         ),
         "manifest" => println!(
             "Manifest format (plain text, one entry per line):
@@ -306,36 +361,96 @@ fn cmd_pack(program: &str, args: &[String]) -> Result<(), Error> {
     })
 }
 
+/// Parse restore-direction flags shared by `decompress` and `extract`.
+///
+/// Returns `(positionals, metadata filter, flatten)`. Pack-direction flags
+/// (`-l`, `--chmod`, ...) are rejected here; `--flatten` is rejected by
+/// `decompress` (it only makes sense for `extract`).
+fn parse_restore_flags(args: &[String]) -> Result<(Vec<String>, MetaFilter, bool), Error> {
+    let mut positionals = Vec::new();
+    let mut flatten = false;
+    let (mut wp, mut wo, mut wc, mut wa) = (false, false, false, false);
+    let (mut np, mut no, mut nc, mut na) = (false, false, false, false);
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--preserve-perms" => wp = true,
+            "--preserve-owner" => wo = true,
+            "--preserve-context" => wc = true,
+            "--preserve-all" => wa = true,
+            "--no-meta" | "--skip-meta" => na = true,
+            "--no-perms" | "--skip-perms" => np = true,
+            "--no-owner" | "--skip-owner" => no = true,
+            "--no-context" | "--skip-context" => nc = true,
+            "--flatten" | "--strip-path" | "-f" => flatten = true,
+            other if other.starts_with('-') => {
+                return Err(Error::Usage(format!("unknown option: {other}")));
+            }
+            _ => positionals.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    let filter = MetaFilter::resolve(wp, wo, wc, wa, np, no, nc, na);
+    Ok((positionals, filter, flatten))
+}
+
 fn cmd_decompress(program: &str, args: &[String]) -> Result<(), Error> {
-    if args.iter().any(|a| a.starts_with('-')) {
+    let (pos, filter, flatten) = parse_restore_flags(args)?;
+    if flatten {
         return Err(Error::Usage(format!(
-            "Usage: {program} decompress <archive> [dest]"
+            "--flatten belongs to extract, not decompress (see `{program} help extract`)"
         )));
     }
-    if args.is_empty() || args.len() > 2 {
+    if pos.is_empty() || pos.len() > 2 {
         return Err(Error::Usage(format!(
-            "Usage: {program} decompress <archive> [dest]"
+            "Usage: {program} decompress <archive> [dest] [options]"
         )));
     }
-    let data = std::fs::read(&args[0])?;
+    let data = std::fs::read(&pos[0])?;
     if data.len() < 8 {
         return Err(Error::BadArchive("file too small".to_string()));
     }
     if &data[0..8] == format::MAGIC {
-        let out = args.get(1).ok_or_else(|| {
+        let out = pos.get(1).ok_or_else(|| {
             Error::Usage(format!(
                 "single-file archive needs an output file: {program} decompress <archive> <output>"
             ))
         })?;
-        decompress::decompress_file(&args[0], out)
+        decompress::decompress_file(&pos[0], out)
     } else if &data[0..8] == pack::MAGIC2 {
-        let dest = args.get(1).map(String::as_str).unwrap_or(".");
-        pack::unpack(&args[0], dest)
+        let dest = pos.get(1).map(String::as_str).unwrap_or(".");
+        pack::unpack(&pos[0], dest, &filter)
     } else {
         Err(Error::BadArchive(
             "unknown magic (want UCOMP01 or UCOMP02)".to_string(),
         ))
     }
+}
+
+fn cmd_list(program: &str, args: &[String]) -> Result<(), Error> {
+    if args.len() != 1 {
+        return Err(Error::Usage(format!(
+            "Usage: {program} list <archive.lgz>"
+        )));
+    }
+    inspect::list(&args[0])
+}
+
+fn cmd_extract(program: &str, args: &[String]) -> Result<(), Error> {
+    let (pos, filter, flatten) = parse_restore_flags(args)?;
+    if pos.len() < 2 || pos.len() > 3 {
+        return Err(Error::Usage(format!(
+            "Usage: {program} extract <archive.lgz> <target_file> [destination] [options]"
+        )));
+    }
+    let dest = pos.get(2).map(String::as_str);
+    inspect::extract(
+        &pos[0],
+        &pos[1],
+        dest,
+        &inspect::ExtractOptions { flatten, filter },
+    )
 }
 
 fn main() -> ExitCode {
@@ -362,6 +477,8 @@ fn main() -> ExitCode {
         Some("compress") => cmd_compress(program, &args[1..]),
         Some("pack") => cmd_pack(program, &args[1..]),
         Some("decompress") => cmd_decompress(program, &args[1..]),
+        Some("list") | Some("ls") => cmd_list(program, &args[1..]),
+        Some("extract") | Some("x") => cmd_extract(program, &args[1..]),
         // Legacy alias: keep the old entry point working as single unpack.
         Some("decompress_all") => Err(Error::Usage(
             "decompress_all was removed. Unpack a UCOMP02 archive instead:\n\

@@ -647,7 +647,7 @@ pub fn pack_single(
 
 /// Join an archive path onto the destination, rejecting absolute paths
 /// and `..` escapes (archive path traversal protection).
-fn safe_join(dest: &Path, rel: &str) -> Result<PathBuf, Error> {
+pub(crate) fn safe_join(dest: &Path, rel: &str) -> Result<PathBuf, Error> {
     if rel.is_empty() {
         return Err(Error::BadArchive("empty path in archive".to_string()));
     }
@@ -673,7 +673,7 @@ fn safe_join(dest: &Path, rel: &str) -> Result<PathBuf, Error> {
 }
 
 /// Invert the solid-time normalization of one file.
-fn denormalize_file(buf: &mut [u8], ranges: &[CodeRange]) -> Result<(), Error> {
+pub(crate) fn denormalize_file(buf: &mut [u8], ranges: &[CodeRange]) -> Result<(), Error> {
     for r in ranges {
         let (off, size) = (r.off as usize, r.size as usize);
         let end = off.checked_add(size).ok_or_else(|| {
@@ -695,7 +695,7 @@ fn denormalize_file(buf: &mut [u8], ranges: &[CodeRange]) -> Result<(), Error> {
 /// Create directories component by component, refusing to traverse
 /// symlinks (Zip-Slip guard: a malicious/absent-minded archive must not
 /// redirect `dest/a/b` through a planted `dest/a -> /somewhere` link).
-fn safe_mkdir_all(dest: &Path, rel: &Path) -> Result<(), Error> {
+pub(crate) fn safe_mkdir_all(dest: &Path, rel: &Path) -> Result<(), Error> {
     let mut cur = PathBuf::from(dest);
     for comp in rel.components() {
         let name = match comp {
@@ -732,7 +732,7 @@ fn safe_mkdir_all(dest: &Path, rel: &Path) -> Result<(), Error> {
 }
 
 /// Write file bytes, refusing to follow a trailing symlink (O_NOFOLLOW).
-fn safe_write_file(full: &Path, bytes: &[u8]) -> Result<(), Error> {
+pub(crate) fn safe_write_file(full: &Path, bytes: &[u8]) -> Result<(), Error> {
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -759,7 +759,10 @@ fn safe_write_file(full: &Path, bytes: &[u8]) -> Result<(), Error> {
 /// metadata last. Nothing is ever written through a symlink planted by an
 /// earlier entry (absolute link targets like `/apex/...` are still honored
 /// as links, they just cannot redirect file writes).
-pub fn unpack(arc_path: &str, dest_dir: &str) -> Result<(), Error> {
+/// Unpack a UCOMP02 archive into `dest_dir` (created when missing).
+///
+/// Only the metadata categories enabled in `filter` are applied.
+pub fn unpack(arc_path: &str, dest_dir: &str, filter: &meta::MetaFilter) -> Result<(), Error> {
     let data = fs::read(arc_path)?;
     let (entries, solid_range) = parse_container(&data)?;
     let mut solid = decompress::decompress_bytes(&data[solid_range])?;
@@ -833,7 +836,7 @@ pub fn unpack(arc_path: &str, dest_dir: &str) -> Result<(), Error> {
         std::os::unix::fs::symlink(target, full)?;
     }
 
-    // Phase 2: metadata — files/links first, directories last so interim
+    // Phase 4: metadata — files/links first, directories last so interim
     // restrictive modes cannot block the restore itself.
     let mut warnings = 0;
     let mut apply_all = |dirs_last: bool| {
@@ -842,7 +845,7 @@ pub fn unpack(arc_path: &str, dest_dir: &str) -> Result<(), Error> {
             if is_dir != dirs_last {
                 continue;
             }
-            for w in meta::apply(full, &e.meta, e.kind == EntryKind::Link) {
+            for w in meta::apply_filtered(full, &e.meta, e.kind == EntryKind::Link, filter) {
                 eprintln!("[!] Warning: {w}");
                 warnings += 1;
             }

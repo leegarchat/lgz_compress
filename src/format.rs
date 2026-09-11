@@ -25,7 +25,20 @@ use crate::error::Error;
 
 /// Archive magic, `MAGIC "UCOMP01"` + NUL, 8 bytes total.
 pub const MAGIC: &[u8; 8] = b"UCOMP01\0";
-/// Header length: magic (8) + original size (8) + chunk count (4).
+
+/// Short human-readable name of a preprocessing type (for `list` output).
+pub fn preproc_name(t: u8) -> &'static str {
+    match t {
+        0 => "raw",
+        1 => "arm64-planes+delta",
+        2 => "delta",
+        3 => "branch-norm",
+        4 => "branch-norm+planes+delta",
+        5 => "file-delta",
+        6 => "branch-norm+file-delta",
+        _ => "unknown",
+    }
+}/// Header length: magic (8) + original size (8) + chunk count (4).
 pub const HEADER_LEN: usize = 20;
 /// Per-chunk header length: type (1) + orig size (4) + comp size (4).
 pub const CHUNK_HDR_LEN: usize = 9;
