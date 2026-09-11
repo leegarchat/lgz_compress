@@ -199,6 +199,7 @@ Examples:
   file <path> [chmod] [owner] [context]
   dir  <path> [chmod] [owner] [context]
   link <path> -> <target> [chmod] [owner] [context]
+  zip  <path> [chmod] [owner] [context]
 
   <path>   Relative to the current directory at pack time.
   chmod    755, 0755, 4755 or rwxr-xr-x (use - to skip).

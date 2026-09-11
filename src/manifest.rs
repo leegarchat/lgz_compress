@@ -5,13 +5,17 @@
 //! file <path> [chmod] [owner] [context]
 //! dir  <path> [chmod] [owner] [context]
 //! link <path> -> <target> [chmod] [owner] [context]
+//! zip  <path> [chmod] [owner] [context]
 //! ```
 //! - `#` comments and blank lines are ignored;
 //! - `<path>` is relative to the current directory at pack time;
 //! - metadata fields are positional (`-` skips one);
 //! - `chmod` accepts octal (`755`, `0755`) or symbolic (`rwxr-xr-x`);
 //! - `owner` accepts `user`, `uid`, `user:group`, `uid:gid` and mixes;
-//! - `context` is a SELinux string (`u:object_r:system_file:s0`).
+//! - `context` is a SELinux string (`u:object_r:system_file:s0`);
+//! - `zip` ingests the archive transparently: inner files join the solid
+//!   blob and the archive is rebuilt on unpack (a plain `file` line whose
+//!   target looks like a zip is ingested the same way).
 
 use std::collections::HashSet;
 
@@ -24,6 +28,9 @@ pub enum EntryKind {
     File,
     Dir,
     Link,
+    /// Transparent zip ingestion (also auto-detected for `file` lines
+    /// pointing at zip data).
+    Zip,
 }
 
 /// One parsed manifest line.
@@ -95,9 +102,10 @@ pub fn parse_manifest(text: &str) -> Result<Vec<ManifestEntry>, Error> {
             "file" => EntryKind::File,
             "dir" => EntryKind::Dir,
             "link" => EntryKind::Link,
+            "zip" => EntryKind::Zip,
             other => {
                 return Err(Error::Manifest(format!(
-                    "line {line_no}: bad type '{other}' (want file/dir/link)"
+                    "line {line_no}: bad type '{other}' (want file/dir/link/zip)"
                 )));
             }
         };

@@ -26,6 +26,7 @@ fn entry_type_char(kind: EntryKind) -> char {
         EntryKind::File => 'F',
         EntryKind::Dir => 'D',
         EntryKind::Link => 'L',
+        EntryKind::Zip => 'Z',
     }
 }
 
@@ -40,6 +41,8 @@ fn list_container(arc_path: &str, data: &[u8]) -> Result<(), Error> {
     let mut n_files = 0u64;
     let mut n_dirs = 0u64;
     let mut n_links = 0u64;
+    let mut n_zips = 0u64;
+    let mut n_inner = 0u64;
     let mut uncompressed: u64 = 0;
 
     for e in &entries {
@@ -75,6 +78,27 @@ fn list_container(arc_path: &str, data: &[u8]) -> Result<(), Error> {
                     format!("{} -> {}", e.path, e.link_target.as_deref().unwrap_or("")),
                 )
             }
+            EntryKind::Zip => {
+                n_zips += 1;
+                let inner_files: Vec<&crate::pack::ZipInner> = e
+                    .zip_inners
+                    .iter()
+                    .filter(|z| z.kind == crate::pack::ZIP_FILE)
+                    .collect();
+                n_inner += inner_files.len() as u64;
+                let total: u64 = inner_files.iter().map(|z| z.solid_size).sum();
+                uncompressed += total;
+                let n = e.zip_inners.len();
+                (
+                    total.to_string(),
+                    format!(
+                        "{} (zip, {} {})",
+                        e.path,
+                        n,
+                        if n == 1 { "entry" } else { "entries" }
+                    ),
+                )
+            }
         };
         owner_w = owner_w.max(owner.len());
         ctx_w = ctx_w.max(ctx.len());
@@ -91,17 +115,18 @@ fn list_container(arc_path: &str, data: &[u8]) -> Result<(), Error> {
 
     println!("Archive: {arc_path} (UCOMP02, {} entries)", entries.len());
     println!(
-        "T PERMS      {:owner_w$} {:ctx_w$} {:>size_w$} PATH",
+        "T PERMS     {:owner_w$} {:ctx_w$} {:>size_w$} PATH",
         "OWNER", "CONTEXT", "SIZE"
     );
     for (t, perms, owner, ctx, size, path) in rows {
-        println!("{t} {perms} {owner:owner_w$} {ctx:ctx_w$} {size:>size_w$} {path}");
+        println!("{t} {perms:9} {owner:owner_w$} {ctx:ctx_w$} {size:>size_w$} {path}");
     }
 
     let solid_comp = solid_range.len() as u64;
     let total = data.len() as u64;
     println!(
-        "Files: {n_files}, Dirs: {n_dirs}, Links: {n_links}, Uncompressed: {uncompressed} bytes"
+        "Files: {n_files}, Dirs: {n_dirs}, Links: {n_links}, Zips: {n_zips} ({n_inner} inner files), \
+         Uncompressed: {uncompressed} bytes"
     );
     println!(
         "Solid: {solid_comp} bytes, Archive: {total} bytes ({:.2}%)",
@@ -250,6 +275,15 @@ pub fn extract(
         Ok(())
     };
 
+    // Solid decode is all-or-nothing: the whole blob is decoded once,
+    // then exactly the requested range is materialized (files and zips).
+    let solid_for_zip: Option<Vec<u8>> =
+        if matches!(entry.kind, EntryKind::File | EntryKind::Zip) {
+            Some(decompress::decompress_bytes(&data[solid_range])?)
+        } else {
+            None
+        };
+
     match entry.kind {
         EntryKind::Dir => {
             if dest_is_dir {
@@ -260,9 +294,7 @@ pub fn extract(
             }
         }
         EntryKind::File => {
-            // Solid decode is all-or-nothing: the whole blob is decoded,
-            // then exactly this entry's range is materialized.
-            let solid = decompress::decompress_bytes(&data[solid_range])?;
+            let solid = solid_for_zip.as_deref().expect("decoded above");
             let end = entry
                 .solid_off
                 .checked_add(entry.solid_size)
@@ -285,6 +317,16 @@ pub fn extract(
             ensure_parent()?;
             place_link(&full, link_target, &entry.path)?;
             println!("[+] Extracted link: {} -> {link_target}", full.display());
+        }
+        EntryKind::Zip => {
+            ensure_parent()?;
+            let solid = solid_for_zip.as_deref().expect("decoded above");
+            pack::rebuild_zip(&full, entry, solid)?;
+            println!(
+                "[+] Extracted zip: {} ({} inner entries)",
+                full.display(),
+                entry.zip_inners.len()
+            );
         }
     }
 

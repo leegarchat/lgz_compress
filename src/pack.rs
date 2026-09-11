@@ -27,9 +27,23 @@
 //!         + [8] solid offset + [8] solid size
 //!   symlink: [2] target length + target bytes
 //!   dir: nothing more
+//!   zip: [2] inner count + per inner file/dir/symlink:
+//!     [1] inner kind (0 = file, 1 = dir, 2 = symlink)
+//!     [2] inner path length + path bytes ('/' separated, no leading /)
+//!     file: [1] method (0 = stored, 8 = deflated) + [4] unix mode
+//!           + [2] year + [1]mo [1]day [1]hour [1]min [1]sec (mtime)
+//!           + [4] crc32 + [2] range count + ranges (as above)
+//!           + [8] solid offset + [8] solid size
+//!     dir: [4] unix mode + mtime (7 bytes, as above)
+//!     symlink: [2] target length + target bytes + [4] unix mode + mtime
 //! [8]  solid UCOMP01 length (u64)
 //! [N]  solid UCOMP01 bytes
 //! ```
+//!
+//! Zip ingestion: a `zip` entry stores a virtual table of contents; inner
+//! file bytes (fully decompressed) join the shared solid blob and get the
+//! same normalization + clustering as top-level files. On unpack the `.zip`
+//! is rebuilt with original methods, modes and timestamps.
 //!
 //! Single files compressed WITH metadata use the same container with one
 //! entry whose payload is a regular single-file UCOMP01 image (no code
@@ -55,6 +69,14 @@ pub const MAGIC2: &[u8; 8] = b"UCOMP02\0";
 const TYPE_FILE: u8 = 0;
 const TYPE_DIR: u8 = 1;
 const TYPE_LINK: u8 = 2;
+const TYPE_ZIP: u8 = 3;
+
+pub(crate) const ZIP_FILE: u8 = 0;
+pub(crate) const ZIP_DIR: u8 = 1;
+pub(crate) const ZIP_LINK: u8 = 2;
+
+pub(crate) const ZIP_STORED: u8 = 0;
+pub(crate) const ZIP_DEFLATED: u8 = 8;
 
 const META_MODE: u8 = 0x01;
 const META_OWNER: u8 = 0x02;
@@ -82,6 +104,43 @@ pub struct PackEntry {
     /// Normalization ranges (files only).
     pub code_ranges: Vec<CodeRange>,
     /// Byte range inside the decompressed solid blob (files only).
+    pub solid_off: u64,
+    pub solid_size: u64,
+    /// Virtual table of contents (zip entries only).
+    pub zip_inners: Vec<ZipInner>,
+}
+
+/// Modification timestamp of a zip inner entry, component-wise (DOS time
+/// has no single canonical integer form across readers).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ZipTime {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+}
+
+/// One file/dir/symlink inside an ingested zip archive.
+#[derive(Debug, Clone)]
+pub struct ZipInner {
+    /// 0 = file, 1 = dir, 2 = symlink.
+    pub kind: u8,
+    /// Inner relative path ('/' separated).
+    pub path: String,
+    /// Files: 0 = stored, 8 = deflated.
+    pub method: u8,
+    /// Full unix mode from the zip (perm bits used on rebuild).
+    pub unix_mode: u32,
+    pub mtime: ZipTime,
+    /// Files: crc32 of the raw bytes (integrity reference).
+    pub crc: u32,
+    /// Symlinks: target path.
+    pub link_target: Option<String>,
+    /// Files: normalization ranges for the solid slice.
+    pub code_ranges: Vec<CodeRange>,
+    /// Files: byte range inside the decompressed solid blob.
     pub solid_off: u64,
     pub solid_size: u64,
 }
@@ -133,6 +192,58 @@ fn push_str(out: &mut Vec<u8>, s: &str, what: &str) -> Result<(), Error> {
     Ok(())
 }
 
+fn push_ztime(out: &mut Vec<u8>, t: &ZipTime) {
+    push_u16(out, t.year);
+    out.push(t.month);
+    out.push(t.day);
+    out.push(t.hour);
+    out.push(t.minute);
+    out.push(t.second);
+}
+
+/// Serialize one ingested zip inner entry.
+fn encode_zip_inner(out: &mut Vec<u8>, z: &ZipInner) -> Result<(), Error> {
+    out.push(z.kind);
+    push_str(&mut *out, &z.path, "zip inner path")?;
+    match z.kind {
+        ZIP_FILE => {
+            if z.method != ZIP_STORED && z.method != ZIP_DEFLATED {
+                return Err(Error::TooLarge(format!(
+                    "bad zip method {} for '{}'",
+                    z.method, z.path
+                )));
+            }
+            out.push(z.method);
+            push_u32(&mut *out, z.unix_mode);
+            push_ztime(&mut *out, &z.mtime);
+            push_u32(&mut *out, z.crc);
+            push_u16(&mut *out, check_len(z.code_ranges.len(), "range count")?);
+            for r in &z.code_ranges {
+                push_u64(&mut *out, r.off);
+                push_u64(&mut *out, r.size);
+                out.push(r.arch);
+            }
+            push_u64(&mut *out, z.solid_off);
+            push_u64(&mut *out, z.solid_size);
+        }
+        ZIP_LINK => {
+            push_str(
+                out,
+                z.link_target.as_deref().unwrap_or(""),
+                "zip link target",
+            )?;
+            push_u32(&mut *out, z.unix_mode);
+            push_ztime(&mut *out, &z.mtime);
+        }
+        _ => {
+            // ZIP_DIR and forward-compatible kinds carry mode + mtime.
+            push_u32(&mut *out, z.unix_mode);
+            push_ztime(&mut *out, &z.mtime);
+        }
+    }
+    Ok(())
+}
+
 /// Serialize entries + solid payload into a UCOMP02 image.
 pub fn encode_container(entries: &[PackEntry], solid: &[u8]) -> Result<Vec<u8>, Error> {
     if entries.len() > u32::MAX as usize {
@@ -149,6 +260,7 @@ pub fn encode_container(entries: &[PackEntry], solid: &[u8]) -> Result<Vec<u8>, 
             EntryKind::File => TYPE_FILE,
             EntryKind::Dir => TYPE_DIR,
             EntryKind::Link => TYPE_LINK,
+            EntryKind::Zip => TYPE_ZIP,
         });
         let mut flags = 0u8;
         if e.meta.mode.is_some() {
@@ -187,6 +299,15 @@ pub fn encode_container(entries: &[PackEntry], solid: &[u8]) -> Result<Vec<u8>, 
                 push_str(&mut out, target, "link target")?;
             }
             EntryKind::Dir => {}
+            EntryKind::Zip => {
+                push_u16(
+                    &mut out,
+                    check_len(e.zip_inners.len(), "zip inner count")?,
+                );
+                for z in &e.zip_inners {
+                    encode_zip_inner(&mut out, z)?;
+                }
+            }
         }
     }
 
@@ -240,6 +361,114 @@ impl<'a> Cursor<'a> {
         String::from_utf8(bytes.to_vec())
             .map_err(|_| Error::BadArchive(format!("non-UTF8 {what}")))
     }
+
+    fn ztime(&mut self, what: &str) -> Result<ZipTime, Error> {
+        Ok(ZipTime {
+            year: self.u16(what)?,
+            month: self.u8(what)?,
+            day: self.u8(what)?,
+            hour: self.u8(what)?,
+            minute: self.u8(what)?,
+            second: self.u8(what)?,
+        })
+    }
+
+    fn ranges(&mut self, entry_idx: usize, what: &str) -> Result<Vec<CodeRange>, Error> {
+        let n = self.u16(what)? as usize;
+        if n > 1_000_000 {
+            return Err(Error::BadArchive(format!(
+                "entry {entry_idx}: bad range count {n}"
+            )));
+        }
+        let mut ranges = Vec::with_capacity(n);
+        for _ in 0..n {
+            let off = self.u64("range off")?;
+            let size = self.u64("range size")?;
+            let arch = self.u8("range arch")?;
+            if arch != ARCH_ARM64 && arch != ARCH_X86 {
+                return Err(Error::BadArchive(format!(
+                    "entry {entry_idx}: bad range arch {arch}"
+                )));
+            }
+            ranges.push(CodeRange { off, size, arch });
+        }
+        Ok(ranges)
+    }
+
+    /// Parse one ingested zip inner entry.
+    fn zip_inner(&mut self, entry_idx: usize) -> Result<ZipInner, Error> {
+        let kind = self.u8("zip inner kind")?;
+        if kind != ZIP_FILE && kind != ZIP_DIR && kind != ZIP_LINK {
+            return Err(Error::BadArchive(format!(
+                "entry {entry_idx}: bad zip inner kind {kind}"
+            )));
+        }
+        let path = self.str("zip inner path")?;
+        if path.is_empty() {
+            return Err(Error::BadArchive(format!(
+                "entry {entry_idx}: empty zip inner path"
+            )));
+        }
+        let (method, unix_mode, mtime, crc, link_target, code_ranges, solid_off, solid_size) =
+            match kind {
+                ZIP_FILE => {
+                    let method = self.u8("zip method")?;
+                    if method != ZIP_STORED && method != ZIP_DEFLATED {
+                        return Err(Error::BadArchive(format!(
+                            "entry {entry_idx}: bad zip method {method}"
+                        )));
+                    }
+                    let unix_mode = self.u32("zip mode")?;
+                    let mtime = self.ztime("zip mtime")?;
+                    let crc = self.u32("zip crc")?;
+                    let ranges = self.ranges(entry_idx, "range count")?;
+                    let off = self.u64("solid off")?;
+                    let size = self.u64("solid size")?;
+                    (method, unix_mode, mtime, crc, None, ranges, off, size)
+                }
+                ZIP_LINK => {
+                    let target = self.str("zip link target")?;
+                    let unix_mode = self.u32("zip mode")?;
+                    let mtime = self.ztime("zip mtime")?;
+                    (
+                        ZIP_STORED,
+                        unix_mode,
+                        mtime,
+                        0,
+                        Some(target),
+                        Vec::new(),
+                        0,
+                        0,
+                    )
+                }
+                _ => {
+                    let unix_mode = self.u32("zip mode")?;
+                    let mtime = self.ztime("zip mtime")?;
+                    (
+                        ZIP_STORED,
+                        unix_mode,
+                        mtime,
+                        0,
+                        None,
+                        Vec::new(),
+                        0,
+                        0,
+                    )
+                }
+            };
+        Ok(ZipInner {
+            kind,
+            path,
+            method,
+            unix_mode,
+            mtime,
+            crc,
+            link_target,
+            code_ranges,
+            solid_off,
+            solid_size,
+        })
+    }
 }
 
 /// Parse a UCOMP02 image. Returns entries + byte range of the solid payload.
@@ -266,6 +495,7 @@ pub fn parse_container(data: &[u8]) -> Result<(Vec<PackEntry>, Range<usize>), Er
             TYPE_FILE => EntryKind::File,
             TYPE_DIR => EntryKind::Dir,
             TYPE_LINK => EntryKind::Link,
+            TYPE_ZIP => EntryKind::Zip,
             t => return Err(Error::BadArchive(format!("entry {i}: bad type {t}"))),
         };
         let flags = cur.u8("meta flags")?;
@@ -288,41 +518,44 @@ pub fn parse_container(data: &[u8]) -> Result<(Vec<PackEntry>, Range<usize>), Er
             meta.context = Some(cur.str("context")?);
         }
 
-        let (link_target, code_ranges, solid_off, solid_size) = match kind {
+        let (link_target, code_ranges, solid_off, solid_size, zip_inners) = match kind {
             EntryKind::File => {
-                let n_ranges = cur.u16("range count")? as usize;
-                if n_ranges > 1_000_000 {
-                    return Err(Error::BadArchive(format!(
-                        "entry {i}: bad range count {n_ranges}"
-                    )));
-                }
-                let mut ranges = Vec::with_capacity(n_ranges);
-                for _ in 0..n_ranges {
-                    let off = cur.u64("range off")?;
-                    let size = cur.u64("range size")?;
-                    let arch = cur.u8("range arch")?;
-                    if arch != ARCH_ARM64 && arch != ARCH_X86 {
-                        return Err(Error::BadArchive(format!(
-                            "entry {i}: bad range arch {arch}"
-                        )));
-                    }
-                    ranges.push(CodeRange { off, size, arch });
-                }
+                let ranges = cur.ranges(i as usize, "range count")?;
                 let off = cur.u64("solid off")?;
                 let size = cur.u64("solid size")?;
-                (None, ranges, off, size)
+                (None, ranges, off, size, Vec::new())
             }
-            EntryKind::Link => (Some(cur.str("link target")?), Vec::new(), 0, 0),
-            EntryKind::Dir => (None, Vec::new(), 0, 0),
+            EntryKind::Link => (
+                Some(cur.str("link target")?),
+                Vec::new(),
+                0,
+                0,
+                Vec::new(),
+            ),
+            EntryKind::Dir => (None, Vec::new(), 0, 0, Vec::new()),
+            EntryKind::Zip => {
+                let n_inners = cur.u16("zip inner count")? as usize;
+                if n_inners > 1_000_000 {
+                    return Err(Error::BadArchive(format!(
+                        "entry {i}: bad zip inner count {n_inners}"
+                    )));
+                }
+                let mut inners = Vec::with_capacity(n_inners);
+                for _ in 0..n_inners {
+                    inners.push(cur.zip_inner(i as usize)?);
+                }
+                (None, Vec::new(), 0, 0, inners)
+            }
         };
         entries.push(PackEntry {
             path,
             kind,
             meta,
             link_target,
-            code_ranges: code_ranges,
+            code_ranges,
             solid_off,
             solid_size,
+            zip_inners,
         });
     }
 
@@ -382,11 +615,22 @@ fn normalize_for_solid(data: &[u8]) -> (Vec<u8>, Vec<CodeRange>, Option<(Arch, u
 
 /// One manifest line resolved against the filesystem.
 ///
-/// `blob` holds normalized file contents (files only); solid offsets are
-/// assigned later, after clustering. `sort` is the cluster key.
+/// `blob` holds normalized file contents (top-level files only);
+/// `zip_works` holds normalized inner blobs (zip entries only).
+/// Solid offsets are assigned later, after clustering.
+/// `sort` is the cluster key for top-level files.
 struct ResolvedEntry {
     entry: PackEntry,
     blob: Option<Vec<u8>>,
+    sort: (u8, String),
+    zip_works: Vec<ZipWork>,
+}
+
+/// One ingested zip inner file awaiting a solid slot.
+struct ZipWork {
+    /// Index into the owning entry's `zip_inners`.
+    inner_idx: usize,
+    blob: Vec<u8>,
     sort: (u8, String),
 }
 
@@ -403,6 +647,177 @@ fn classify(path: &str, data: &[u8], elf_id: Option<(Arch, u16)>) -> (u8, String
         None => 4,
     };
     (class, path.to_lowercase())
+}
+
+/// Heuristic zip detection for `file` manifest lines: known extensions
+/// or a zip signature (local header, central directory, end record).
+fn looks_like_zip(path: &str, head: &[u8]) -> bool {
+    let lower = path.to_lowercase();
+    lower.ends_with(".zip") || lower.ends_with(".jar") || lower.ends_with(".apk")
+        || head.starts_with(b"PK\x03\x04")
+        || head.starts_with(b"PK\x01\x02")
+        || head.starts_with(b"PK\x05\x06")
+}
+
+fn zip_time_from(dt: Option<zip::DateTime>) -> ZipTime {
+    match dt {
+        Some(t) => ZipTime {
+            year: t.year(),
+            month: t.month(),
+            day: t.day(),
+            hour: t.hour(),
+            minute: t.minute(),
+            second: t.second().min(58),
+        },
+        None => ZipTime {
+            year: 1980,
+            month: 1,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+        },
+    }
+}
+
+/// Ingest one zip archive: read every entry, normalize file contents for
+/// the shared solid blob, record the virtual table of contents.
+///
+/// Only stored/deflated entries are supported; anything else (bzip2, zstd,
+/// encrypted, unsafe names, duplicates) is a hard error — silently
+/// degrading a ramdisk archive is worse than refusing it.
+fn ingest_zip(
+    spec: &ManifestEntry,
+    raw: &[u8],
+    input_total: &mut u64,
+) -> Result<(Vec<ZipInner>, Vec<ZipWork>), Error> {
+    *input_total += raw.len() as u64;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(raw)).map_err(|e| {
+        Error::Manifest(format!("line {}: not a zip archive '{}': {e}", spec.line_no, spec.path))
+    })?;
+    let mut inners = Vec::new();
+    let mut works = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for idx in 0..archive.len() {
+        let mut file = archive.by_index(idx).map_err(|e| {
+            Error::Manifest(format!("line {}: bad zip entry #{idx} in '{}': {e}", spec.line_no, spec.path))
+        })?;
+        let enclosed = file.enclosed_name().ok_or_else(|| {
+            Error::Manifest(format!(
+                "line {}: unsafe name in '{}': '{}'",
+                spec.line_no,
+                spec.path,
+                file.name()
+            ))
+        })?;
+        let name = enclosed
+            .to_str()
+            .ok_or_else(|| {
+                Error::Manifest(format!(
+                    "line {}: non-UTF8 name in '{}'",
+                    spec.line_no, spec.path
+                ))
+            })?
+            .replace('\\', "/");
+        if name.is_empty() || !seen.insert(name.clone()) {
+            return Err(Error::Manifest(format!(
+                "line {}: bad/duplicate name in '{}': '{name}'",
+                spec.line_no, spec.path
+            )));
+        }
+
+        if file.is_dir() {
+            inners.push(ZipInner {
+                kind: ZIP_DIR,
+                path: name,
+                method: ZIP_STORED,
+                unix_mode: file.unix_mode().unwrap_or(0o755),
+                mtime: zip_time_from(file.last_modified()),
+                crc: 0,
+                link_target: None,
+                code_ranges: Vec::new(),
+                solid_off: 0,
+                solid_size: 0,
+            });
+        } else if file.is_symlink() {
+            let mut target = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut target).map_err(|e| {
+                Error::Manifest(format!("line {}: cannot read link '{name}': {e}", spec.line_no))
+            })?;
+            let target = String::from_utf8(target).map_err(|_| {
+                Error::Manifest(format!(
+                    "line {}: non-UTF8 link target '{name}'",
+                    spec.line_no
+                ))
+            })?;
+            inners.push(ZipInner {
+                kind: ZIP_LINK,
+                path: name,
+                method: ZIP_STORED,
+                unix_mode: file.unix_mode().unwrap_or(0o777),
+                mtime: zip_time_from(file.last_modified()),
+                crc: 0,
+                link_target: Some(target),
+                code_ranges: Vec::new(),
+                solid_off: 0,
+                solid_size: 0,
+            });
+        } else {
+            let method = match file.compression() {
+                zip::CompressionMethod::Stored => ZIP_STORED,
+                zip::CompressionMethod::Deflated => ZIP_DEFLATED,
+                m => {
+                    return Err(Error::Manifest(format!(
+                        "line {}: unsupported method {m:?} for '{name}' (only stored/deflated)",
+                        spec.line_no
+                    )));
+                }
+            };
+            let unix_mode = file.unix_mode().unwrap_or(0o644);
+            let mtime = zip_time_from(file.last_modified());
+            let mut bytes = Vec::with_capacity(file.size() as usize);
+            std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|e| {
+                Error::Manifest(format!("line {}: cannot read '{name}': {e}", spec.line_no))
+            })?;
+            let crc = file.crc32();
+            // Transparent UCOMP01 ingestion: inner payloads compressed with
+            // the legacy single-file tool are decoded to clean bytes first,
+            // so the solid stream never sees opaque high-entropy blobs.
+            // (The rebuilt zip therefore holds raw files by design.)
+            let bytes = if bytes.len() >= 8 && bytes[0..8] == *crate::format::MAGIC {
+                crate::decompress::decompress_bytes(&bytes).map_err(|e| {
+                    Error::Manifest(format!(
+                        "line {}: inner UCOMP payload '{name}' is corrupt: {e}",
+                        spec.line_no
+                    ))
+                })?
+            } else {
+                bytes
+            };
+            let (blob, ranges, elf_id) = normalize_for_solid(&bytes);
+            let sort = classify(&name, &bytes, elf_id);
+            let inner_idx = inners.len();
+            inners.push(ZipInner {
+                kind: ZIP_FILE,
+                path: name,
+                method,
+                unix_mode,
+                mtime,
+                crc,
+                link_target: None,
+                code_ranges: ranges,
+                solid_off: 0,
+                solid_size: 0,
+            });
+            works.push(ZipWork {
+                inner_idx,
+                blob,
+                sort,
+            });
+        }
+    }
+    Ok((inners, works))
 }
 
 /// Resolve one manifest line against the filesystem.
@@ -429,8 +844,14 @@ fn resolve_entry(
         ))
     })?;
     let ft = st.file_type();
+    let expected = match spec.kind {
+        EntryKind::File => "file",
+        EntryKind::Dir => "dir",
+        EntryKind::Link => "link",
+        EntryKind::Zip => "zip",
+    };
     let kind_ok = match spec.kind {
-        EntryKind::File => ft.is_file(),
+        EntryKind::File | EntryKind::Zip => ft.is_file(),
         EntryKind::Dir => ft.is_dir(),
         EntryKind::Link => ft.is_symlink(),
     };
@@ -452,7 +873,7 @@ fn resolve_entry(
             return Ok(None);
         }
         return Err(Error::Manifest(format!(
-            "line {}: '{}' is {actual}, manifest says otherwise",
+            "line {}: '{}' is {actual}, manifest wants {expected}",
             spec.line_no, spec.path
         )));
     }
@@ -461,9 +882,40 @@ fn resolve_entry(
     meta.apply_forced(&opts.forced);
     meta::fill_preserve(&mut meta, fs_path, opts.preserve)?;
 
+    // A `zip` line — or a `file` line pointing at zip data — is ingested:
+    // inner files join the shared solid blob, the table of contents stays
+    // in the entry for rebuild-on-unpack. The file is read once here and
+    // reused below.
+    let raw_file: Option<Vec<u8>> = match spec.kind {
+        EntryKind::File | EntryKind::Zip => Some(fs::read(fs_path)?),
+        _ => None,
+    };
+    if spec.kind == EntryKind::Zip
+        || (spec.kind == EntryKind::File
+            && looks_like_zip(&spec.path, raw_file.as_deref().unwrap_or_default()))
+    {
+        let raw = raw_file.unwrap_or_default();
+        let (inners, works) = ingest_zip(spec, &raw, input_total)?;
+        return Ok(Some(ResolvedEntry {
+            entry: PackEntry {
+                path: spec.path.clone(),
+                kind: EntryKind::Zip,
+                meta,
+                link_target: None,
+                code_ranges: Vec::new(),
+                solid_off: 0,
+                solid_size: 0,
+                zip_inners: inners,
+            },
+            blob: None,
+            sort: (0, String::new()),
+            zip_works: works,
+        }));
+    }
+
     let (link_target, code_ranges, blob, sort) = match spec.kind {
         EntryKind::File => {
-            let raw = fs::read(fs_path)?;
+            let raw = raw_file.unwrap_or_default();
             *input_total += raw.len() as u64;
             let (blob, ranges, elf_id) = normalize_for_solid(&raw);
             let sort = classify(&spec.path, &raw, elf_id);
@@ -490,6 +942,7 @@ fn resolve_entry(
             (Some(target), Vec::new(), None, (0, String::new()))
         }
         EntryKind::Dir => (None, Vec::new(), None, (0, String::new())),
+        EntryKind::Zip => unreachable!("zip entries return from resolve_entry early"),
     };
 
     Ok(Some(ResolvedEntry {
@@ -501,9 +954,11 @@ fn resolve_entry(
             code_ranges,
             solid_off: 0,
             solid_size: 0,
+            zip_inners: Vec::new(),
         },
         blob,
         sort,
+        zip_works: Vec::new(),
     }))
 }
 
@@ -516,12 +971,15 @@ pub fn pack(manifest_path: &str, out_path: &str, opts: &PackOptions) -> Result<(
     let mut input_total: u64 = 0;
     let mut skipped = 0;
     let mut clustered: Vec<ResolvedEntry> = Vec::with_capacity(specs.len());
+    let mut zips: Vec<ResolvedEntry> = Vec::new();
     let mut others: Vec<PackEntry> = Vec::new();
     for spec in &specs {
         match resolve_entry(spec, opts, &mut input_total)? {
             Some(r) => {
                 if r.blob.is_some() {
                     clustered.push(r);
+                } else if !r.zip_works.is_empty() {
+                    zips.push(r);
                 } else {
                     others.push(r.entry);
                 }
@@ -531,35 +989,72 @@ pub fn pack(manifest_path: &str, out_path: &str, opts: &PackOptions) -> Result<(
     }
 
     // Cluster: related files share the LZMA2 dictionary window at minimal
-    // distance. Dirs/links keep manifest order after the files.
-    clustered.sort_by(|a, b| a.sort.cmp(&b.sort));
-    let mut solid = Vec::new();
-    let mut entries: Vec<PackEntry> = Vec::with_capacity(specs.len());
-    for mut r in clustered {
+    // distance. Zip inners join the same pool as top-level files; dirs,
+    // links and zip containers keep manifest order after the files.
+    enum Back {
+        Top(usize),
+        Zip(usize, usize),
+    }
+    let mut pool: Vec<((u8, String), Vec<u8>, Back)> = Vec::new();
+    for (i, r) in clustered.iter_mut().enumerate() {
         let blob = r.blob.take().expect("clustered entry has a blob");
-        // 4-byte alignment keeps LZMA pos_state (pb=2) in sync with ARM64
-        // opcodes across file boundaries.
+        pool.push((r.sort.clone(), blob, Back::Top(i)));
+    }
+    for (zi, z) in zips.iter_mut().enumerate() {
+        let works = std::mem::take(&mut z.zip_works);
+        for w in works {
+            pool.push((w.sort, w.blob, Back::Zip(zi, w.inner_idx)));
+        }
+    }
+    pool.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Lay out the solid blob in clustered order (4-byte aligned: keeps
+    // LZMA pos_state (pb=2) in sync with ARM64 opcodes across boundaries).
+    let mut solid = Vec::new();
+    for (_, blob, back) in pool {
         let pad = (4 - (solid.len() % 4)) % 4;
         solid.resize(solid.len() + pad, 0);
-        r.entry.solid_off = solid.len() as u64;
-        r.entry.solid_size = blob.len() as u64;
+        let (off, size) = (solid.len() as u64, blob.len() as u64);
         solid.extend_from_slice(&blob);
+        match back {
+            Back::Top(i) => {
+                clustered[i].entry.solid_off = off;
+                clustered[i].entry.solid_size = size;
+            }
+            Back::Zip(zi, ii) => {
+                zips[zi].entry.zip_inners[ii].solid_off = off;
+                zips[zi].entry.zip_inners[ii].solid_size = size;
+            }
+        }
+    }
+    let mut entries: Vec<PackEntry> = Vec::with_capacity(specs.len());
+    for r in clustered {
         entries.push(r.entry);
+    }
+    for z in zips {
+        entries.push(z.entry);
     }
     entries.extend(others);
     if entries.is_empty() {
         return Err(Error::Manifest("nothing to pack".to_string()));
     }
 
-    let (n_files, n_dirs, n_links) = entries.iter().fold((0, 0, 0), |(f, d, l), e| {
-        match e.kind {
-            EntryKind::File => (f + 1, d, l),
-            EntryKind::Dir => (f, d + 1, l),
-            EntryKind::Link => (f, d, l + 1),
-        }
-    });
+    let (n_files, n_dirs, n_links, n_zips, n_inner) =
+        entries.iter().fold((0, 0, 0, 0, 0), |(f, d, l, z, n), e| match e.kind {
+            EntryKind::File => (f + 1, d, l, z, n),
+            EntryKind::Dir => (f, d + 1, l, z, n),
+            EntryKind::Link => (f, d, l + 1, z, n),
+            EntryKind::Zip => (
+                f,
+                d,
+                l,
+                z + 1,
+                n + e.zip_inners.iter().filter(|i| i.kind == ZIP_FILE).count(),
+            ),
+        });
     println!(
-        "[*] Packing {n_files} files, {n_dirs} dirs, {n_links} symlinks (solid blob: {} bytes)",
+        "[*] Packing {n_files} files, {n_dirs} dirs, {n_links} symlinks, \
+         {n_zips} zips ({n_inner} inner files) (solid blob: {} bytes)",
         solid.len()
     );
 
@@ -581,7 +1076,8 @@ pub fn pack(manifest_path: &str, out_path: &str, opts: &PackOptions) -> Result<(
     fs::write(out_path, &image)?;
 
     println!(
-        "[+] PACKED: {n_files} files + {n_dirs} dirs + {n_links} links, \
+        "[+] PACKED: {n_files} files + {n_dirs} dirs + {n_links} links + \
+         {n_zips} zips ({n_inner} inner files), \
          {input_total} -> {} bytes ({:.2}%){}",
         image.len(),
         100.0 * image.len() as f64 / input_total.max(1) as f64,
@@ -629,6 +1125,7 @@ pub fn pack_single(
         code_ranges: Vec::new(),
         solid_off: 0,
         solid_size: data.len() as u64,
+        zip_inners: Vec::new(),
     };
     let image = encode_container(std::slice::from_ref(&entry), &solid_ucomp)?;
     fs::write(out_path, &image)?;
@@ -753,13 +1250,146 @@ pub(crate) fn safe_write_file(full: &Path, bytes: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
+fn zip_datetime(t: &ZipTime) -> zip::DateTime {
+    zip::DateTime::from_date_and_time(
+        t.year,
+        t.month.max(1),
+        t.day.max(1),
+        t.hour,
+        t.minute,
+        t.second,
+    )
+    .unwrap_or_default()
+}
+
+/// Slice one file's bytes out of the solid blob with bounds checks.
+fn solid_slice<'a>(
+    solid: &'a [u8],
+    off: u64,
+    size: u64,
+    what: &str,
+) -> Result<&'a [u8], Error> {
+    let end = off.checked_add(size).ok_or_else(|| {
+        Error::BadArchive(format!("bad solid range for '{what}'"))
+    })?;
+    if end > solid.len() as u64 {
+        return Err(Error::BadArchive(format!(
+            "solid range outside blob for '{what}'"
+        )));
+    }
+    Ok(&solid[off as usize..end as usize])
+}
+
+/// Rebuild one `.zip` file from its table of contents.
+///
+/// Inner files are sliced out of the solid blob, denormalized per their
+/// code ranges, and stored back with original methods (stored/deflated),
+/// unix modes and timestamps. CRCs are recomputed by the writer; the
+/// stored CRC was already verified at pack time.
+pub(crate) fn rebuild_zip(
+    full: &Path,
+    entry: &PackEntry,
+    solid: &[u8],
+) -> Result<(), Error> {
+    // Never write through a pre-existing symlink (same guard as files).
+    if fs::symlink_metadata(full).is_ok() {
+        let st = fs::symlink_metadata(full)?;
+        if st.file_type().is_symlink() {
+            return Err(Error::BadArchive(format!(
+                "refusing to write through symlink: '{}'",
+                full.display()
+            )));
+        }
+        if st.file_type().is_dir() {
+            return Err(Error::Meta(format!(
+                "cannot replace directory with zip: '{}'",
+                entry.path
+            )));
+        }
+        fs::remove_file(full)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(full)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                Error::BadArchive(format!(
+                    "refusing to write through symlink: '{}'",
+                    full.display()
+                ))
+            } else {
+                Error::Io(e)
+            }
+        })?;
+    let mut writer = zip::ZipWriter::new(file);
+    for z in &entry.zip_inners {
+        let dt = zip_datetime(&z.mtime);
+        match z.kind {
+            ZIP_FILE => {
+                let method = match z.method {
+                    ZIP_STORED => zip::CompressionMethod::Stored,
+                    ZIP_DEFLATED => zip::CompressionMethod::Deflated,
+                    m => {
+                        return Err(Error::BadArchive(format!(
+                            "bad zip method {m} for '{}'",
+                            z.path
+                        )));
+                    }
+                };
+                let options = zip::write::SimpleFileOptions::default()
+                    .compression_method(method)
+                    .unix_permissions(z.unix_mode)
+                    .last_modified_time(dt);
+                let raw = solid_slice(solid, z.solid_off, z.solid_size, &z.path)?;
+                let mut bytes = raw.to_vec();
+                denormalize_file(&mut bytes, &z.code_ranges)?;
+                writer.start_file(&z.path, options).map_err(|e| {
+                    Error::BadArchive(format!("cannot add '{}' to zip: {e}", z.path))
+                })?;
+                std::io::Write::write_all(&mut writer, &bytes).map_err(|e| {
+                    Error::BadArchive(format!("cannot write '{}' to zip: {e}", z.path))
+                })?;
+            }
+            ZIP_LINK => {
+                let options = zip::write::SimpleFileOptions::default()
+                    .unix_permissions(z.unix_mode)
+                    .last_modified_time(dt);
+                writer
+                    .add_symlink(
+                        &z.path,
+                        z.link_target.as_deref().unwrap_or(""),
+                        options,
+                    )
+                    .map_err(|e| {
+                        Error::BadArchive(format!("cannot add link '{}' to zip: {e}", z.path))
+                    })?;
+            }
+            _ => {
+                let options = zip::write::SimpleFileOptions::default()
+                    .unix_permissions(z.unix_mode)
+                    .last_modified_time(dt);
+                writer.add_directory(&z.path, options).map_err(|e| {
+                    Error::BadArchive(format!("cannot add dir '{}' to zip: {e}", z.path))
+                })?;
+            }
+        }
+    }
+    writer.finish().map_err(|e| {
+        Error::BadArchive(format!("cannot finish zip '{}': {e}", entry.path))
+    })?;
+    Ok(())
+}
+
 /// Unpack a UCOMP02 archive into `dest_dir` (created when missing).
 ///
 /// Order matters for safety: directories first, then files, then symlinks,
-/// metadata last. Nothing is ever written through a symlink planted by an
-/// earlier entry (absolute link targets like `/apex/...` are still honored
-/// as links, they just cannot redirect file writes).
-/// Unpack a UCOMP02 archive into `dest_dir` (created when missing).
+/// then zip containers, metadata last. Nothing is ever written through a
+/// symlink planted by an earlier entry (absolute link targets like
+/// `/apex/...` are still honored as links, they just cannot redirect
+/// file writes).
 ///
 /// Only the metadata categories enabled in `filter` are applied.
 pub fn unpack(arc_path: &str, dest_dir: &str, filter: &meta::MetaFilter) -> Result<(), Error> {
@@ -780,12 +1410,12 @@ pub fn unpack(arc_path: &str, dest_dir: &str, filter: &meta::MetaFilter) -> Resu
         full_paths.push(safe_join(dest, &e.path)?);
     }
 
-    // Phase 1: directories (explicit + parents of files/links).
+    // Phase 1: directories (explicit + parents of files/links/zips).
     for (e, full) in entries.iter().zip(full_paths.iter()) {
         let rel = Path::new(&e.path);
         match e.kind {
             EntryKind::Dir => safe_mkdir_all(dest, rel)?,
-            EntryKind::File | EntryKind::Link => {
+            EntryKind::File | EntryKind::Link | EntryKind::Zip => {
                 if let Some(parent) = rel.parent() {
                     if !parent.as_os_str().is_empty() {
                         safe_mkdir_all(dest, parent)?;
@@ -834,6 +1464,17 @@ pub fn unpack(arc_path: &str, dest_dir: &str, filter: &meta::MetaFilter) -> Resu
             fs::remove_file(full)?;
         }
         std::os::unix::fs::symlink(target, full)?;
+    }
+
+    // Phase 3b: zip containers — rebuilt from the table of contents with
+    // original methods, modes and timestamps. Symlinks already exist, so
+    // nothing inside a rebuilt zip can redirect these writes (and zip
+    // writes never traverse: entries are created inside the new file).
+    for (e, full) in entries.iter().zip(full_paths.iter()) {
+        if e.kind != EntryKind::Zip {
+            continue;
+        }
+        rebuild_zip(full, e, &solid)?;
     }
 
     // Phase 4: metadata — files/links first, directories last so interim
