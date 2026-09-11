@@ -193,9 +193,14 @@ fn build_modes(
     }
 
     // tmp_adv: normalize + in-place planes + delta (ARM64 code only).
+    // tmp_planes: normalize + in-place planes, no delta (type 8). Delta on
+    // opcode slices destroys match periodicity for LZMA2, so the pure
+    // plane-split variant joins the optimizer next to type 4.
     let mut adv: Option<Vec<u8>> = None;
+    let mut planes_blob: Option<Vec<u8>> = None;
     if need_adv {
         let mut tmp = buffers[0].clone();
+        let mut tmp_no_delta = buffers[0].clone();
         for c in chunks {
             if c.is_code {
                 let slice = &mut tmp[c.off..c.off + c.size];
@@ -208,9 +213,14 @@ fn build_modes(
                         delta::encode(&mut slice[p * n_instr..(p + 1) * n_instr]);
                     }
                 }
+                let pslice = &mut tmp_no_delta[c.off..c.off + c.size];
+                normalize::arm64_normalize(pslice);
+                let p = planes::encode(pslice);
+                pslice.copy_from_slice(&p);
             }
         }
         adv = Some(tmp);
+        planes_blob = Some(tmp_no_delta);
     }
 
     // tmp_norm_total_delta: delta of the normalized image.
@@ -228,7 +238,12 @@ fn build_modes(
         modes.push((buffers.len() - 1, 3));
     }
     if opt_level >= 3 {
-        for (buf, typ) in [(adv, 4u8), (total_delta, 5u8), (norm_total_delta, 6u8)] {
+        for (buf, typ) in [
+            (adv, 4u8),
+            (planes_blob, 8u8),
+            (total_delta, 5u8),
+            (norm_total_delta, 6u8),
+        ] {
             if let Some(buf) = buf {
                 buffers.push(buf);
                 modes.push((buffers.len() - 1, typ));
@@ -238,6 +253,10 @@ fn build_modes(
         if let Some(buf) = adv {
             buffers.push(buf);
             modes.push((buffers.len() - 1, 4));
+        }
+        if let Some(buf) = planes_blob {
+            buffers.push(buf);
+            modes.push((buffers.len() - 1, 8));
         }
         if !is_elf {
             if let Some(buf) = total_delta {

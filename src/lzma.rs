@@ -23,11 +23,16 @@ use lzma_rust2::{EncodeMode, Lzma2Options, Lzma2Reader, Lzma2Writer, LzmaOptions
 
 use crate::error::Error;
 
-/// Max dictionary for level 3 (32 MiB), 16 MiB otherwise. Mirrors
-/// `get_optimal_dict_size` in lgzv3.c.
+/// Max dictionary: 16 MiB normally, 32 MiB on level 3, and 64 MiB on
+/// level 3 for inputs over 32 MiB (ramdisk-scale solids on modern devices
+/// with 8-16 GB RAM). Mirrors `get_optimal_dict_size` in lgzv3.c, extended.
 pub fn optimal_dict_size(in_size: u64, opt_level: u8) -> u32 {
     let max_dict: u64 = if opt_level >= 3 {
-        32 * 1024 * 1024
+        if in_size > 32 * 1024 * 1024 {
+            64 * 1024 * 1024
+        } else {
+            32 * 1024 * 1024
+        }
     } else {
         16 * 1024 * 1024
     };

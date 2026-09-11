@@ -38,6 +38,19 @@ fn undo_type1(payload: Vec<u8>) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
+/// Undo preprocessing of type 8 on one code section: un-plane (in place),
+/// then branch denormalization. Same as the type 4 section path but
+/// without the delta layer.
+fn undo_planes_blob_section(buf: &mut [u8], arch: Arch) {
+    match arch {
+        Arch::Arm64 => {
+            let unplaned = planes::decode(buf);
+            buf.copy_from_slice(&unplaned);
+            normalize::arm64_denormalize(buf);
+        }
+        Arch::X86 => normalize::x86_denormalize(buf),
+    }
+}
 /// Undo preprocessing of type 4 on one code section: per-plane delta
 /// decode, un-plane (in place), then branch denormalization.
 /// On x86 it is a plain branch denormalization.
@@ -109,6 +122,23 @@ fn undo_preproc(mut payload: Vec<u8>, preproc: u8) -> Result<Vec<u8>, Error> {
         6 => {
             delta::decode(&mut payload);
             denormalize_blob_sections(&mut payload);
+            Ok(payload)
+        }
+        8 => {
+            if let Some(info) = elf::parse(&payload) {
+                // Collect ranges first: `elf::parse` borrows `payload`.
+                let ranges: Vec<(usize, usize, Arch)> = info
+                    .sections
+                    .iter()
+                    .filter(|s| s.is_code)
+                    .map(|s| (s.offset as usize, s.size as usize, info.arch))
+                    .collect();
+                for (off, size, arch) in ranges {
+                    if off + size <= payload.len() {
+                        undo_planes_blob_section(&mut payload[off..off + size], arch);
+                    }
+                }
+            }
             Ok(payload)
         }
         _ => Err(Error::BadArchive(format!(
@@ -188,5 +218,30 @@ mod tests {
         let mut img = format::encode_header(orig.len() as u64, &[meta]);
         img.extend_from_slice(&comp);
         assert_eq!(decompress_bytes(&img).unwrap(), orig);
+    }
+
+    /// Type 8 section path (planes without delta): normalize + plane-split
+    /// a buffer, then invert it exactly like the unpacker does per section.
+    #[test]
+    fn type8_section_roundtrip() {
+        let mut orig: Vec<u8> = vec![
+            0x00, 0x04, 0x00, 0x94, // BL
+            0x00, 0x00, 0x00, 0x90, // ADRP
+            0x02, 0x00, 0x40, 0xF9, // LDR literal
+            0x40, 0x00, 0x00, 0x34, // CBZ
+            0x1F, 0x20, 0x03, 0xD5, // NOP
+            0xC0, 0x03, 0x5F, 0xD6, // RET
+        ];
+        // Odd tail must survive untouched.
+        orig.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+
+        let mut packed = orig.clone();
+        normalize::arm64_normalize(&mut packed[..24]);
+        let planed = planes::encode(&packed[..24]);
+        packed[..24].copy_from_slice(&planed);
+
+        let mut out = packed.clone();
+        undo_planes_blob_section(&mut out[..24], Arch::Arm64);
+        assert_eq!(out, orig);
     }
 }

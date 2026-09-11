@@ -345,12 +345,13 @@ pub fn parse_container(data: &[u8]) -> Result<(Vec<PackEntry>, Range<usize>), Er
 
 /// Branch-normalize one file for the solid blob.
 ///
-/// Returns the (possibly normalized) bytes plus the code ranges the
-/// unpacker needs to invert the transform. Non-ELF files pass through
-/// untouched with no ranges.
-fn normalize_for_solid(data: &[u8]) -> (Vec<u8>, Vec<CodeRange>) {
+/// Returns the (possibly normalized) bytes, the code ranges the unpacker
+/// needs to invert the transform, and the ELF identity (arch + e_type)
+/// used for pre-packing clustering. Non-ELF files pass through untouched
+/// with no ranges.
+fn normalize_for_solid(data: &[u8]) -> (Vec<u8>, Vec<CodeRange>, Option<(Arch, u16)>) {
     let Some(info) = elf::parse(data) else {
-        return (data.to_vec(), Vec::new());
+        return (data.to_vec(), Vec::new(), None);
     };
     let arch_byte = match info.arch {
         Arch::Arm64 => ARCH_ARM64,
@@ -376,17 +377,44 @@ fn normalize_for_solid(data: &[u8]) -> (Vec<u8>, Vec<CodeRange>) {
             arch: arch_byte,
         });
     }
-    (out, ranges)
+    (out, ranges, Some((info.arch, info.e_type)))
 }
 
-/// Resolve one manifest line against the filesystem and append it to the
-/// solid blob. Returns the entry (`None` for skipped special files).
+/// One manifest line resolved against the filesystem.
+///
+/// `blob` holds normalized file contents (files only); solid offsets are
+/// assigned later, after clustering. `sort` is the cluster key.
+struct ResolvedEntry {
+    entry: PackEntry,
+    blob: Option<Vec<u8>>,
+    sort: (u8, String),
+}
+
+/// Cluster key: arm64 executables first, then arm64 shared objects, then
+/// other ELF, then scripts, then remaining data. Names order
+/// lexicographically inside a class so related libraries (same CRT
+/// glue, similar symbols) land next to each other.
+fn classify(path: &str, data: &[u8], elf_id: Option<(Arch, u16)>) -> (u8, String) {
+    let class = match elf_id {
+        Some((Arch::Arm64, 2)) => 0,
+        Some((Arch::Arm64, _)) => 1,
+        Some(_) => 2,
+        None if path.ends_with(".sh") || data.starts_with(b"#!") => 3,
+        None => 4,
+    };
+    (class, path.to_lowercase())
+}
+
+/// Resolve one manifest line against the filesystem.
+///
+/// Returns the entry (`None` for skipped special files). File contents are
+/// returned separately; the caller clusters files and lays out the solid
+/// blob afterwards.
 fn resolve_entry(
     spec: &ManifestEntry,
     opts: &PackOptions,
-    solid: &mut Vec<u8>,
     input_total: &mut u64,
-) -> Result<Option<PackEntry>, Error> {
+) -> Result<Option<ResolvedEntry>, Error> {
     if Path::new(&spec.path).is_absolute() {
         return Err(Error::Manifest(format!(
             "line {}: path must be relative: '{}'",
@@ -433,21 +461,13 @@ fn resolve_entry(
     meta.apply_forced(&opts.forced);
     meta::fill_preserve(&mut meta, fs_path, opts.preserve)?;
 
-    let (link_target, code_ranges, solid_off, solid_size) = match spec.kind {
+    let (link_target, code_ranges, blob, sort) = match spec.kind {
         EntryKind::File => {
             let raw = fs::read(fs_path)?;
             *input_total += raw.len() as u64;
-            let (blob, ranges) = normalize_for_solid(&raw);
-            // Keep every file 4-byte aligned in the solid blob: LZMA
-            // pos_state (pb=2) keys literal contexts by position % 4, so a
-            // misaligned file would skew opcode statistics for all ARM64
-            // code packed after it.
-            let pad = (4 - (solid.len() % 4)) % 4;
-            solid.resize(solid.len() + pad, 0);
-            let off = solid.len() as u64;
-            let size = blob.len() as u64;
-            solid.extend_from_slice(&blob);
-            (None, ranges, off, size)
+            let (blob, ranges, elf_id) = normalize_for_solid(&raw);
+            let sort = classify(&spec.path, &raw, elf_id);
+            (None, ranges, Some(blob), sort)
         }
         EntryKind::Link => {
             let target = fs::read_link(fs_path)?;
@@ -467,19 +487,23 @@ fn resolve_entry(
                     )));
                 }
             }
-            (Some(target), Vec::new(), 0, 0)
+            (Some(target), Vec::new(), None, (0, String::new()))
         }
-        EntryKind::Dir => (None, Vec::new(), 0, 0),
+        EntryKind::Dir => (None, Vec::new(), None, (0, String::new())),
     };
 
-    Ok(Some(PackEntry {
-        path: spec.path.clone(),
-        kind: spec.kind,
-        meta,
-        link_target,
-        code_ranges,
-        solid_off,
-        solid_size,
+    Ok(Some(ResolvedEntry {
+        entry: PackEntry {
+            path: spec.path.clone(),
+            kind: spec.kind,
+            meta,
+            link_target,
+            code_ranges,
+            solid_off: 0,
+            solid_size: 0,
+        },
+        blob,
+        sort,
     }))
 }
 
@@ -489,16 +513,40 @@ pub fn pack(manifest_path: &str, out_path: &str, opts: &PackOptions) -> Result<(
     let specs = manifest::parse_manifest(&text)?;
     println!("[*] Manifest: {} entries", specs.len());
 
-    let mut solid = Vec::new();
-    let mut entries = Vec::with_capacity(specs.len());
     let mut input_total: u64 = 0;
     let mut skipped = 0;
+    let mut clustered: Vec<ResolvedEntry> = Vec::with_capacity(specs.len());
+    let mut others: Vec<PackEntry> = Vec::new();
     for spec in &specs {
-        match resolve_entry(spec, opts, &mut solid, &mut input_total)? {
-            Some(e) => entries.push(e),
+        match resolve_entry(spec, opts, &mut input_total)? {
+            Some(r) => {
+                if r.blob.is_some() {
+                    clustered.push(r);
+                } else {
+                    others.push(r.entry);
+                }
+            }
             None => skipped += 1,
         }
     }
+
+    // Cluster: related files share the LZMA2 dictionary window at minimal
+    // distance. Dirs/links keep manifest order after the files.
+    clustered.sort_by(|a, b| a.sort.cmp(&b.sort));
+    let mut solid = Vec::new();
+    let mut entries: Vec<PackEntry> = Vec::with_capacity(specs.len());
+    for mut r in clustered {
+        let blob = r.blob.take().expect("clustered entry has a blob");
+        // 4-byte alignment keeps LZMA pos_state (pb=2) in sync with ARM64
+        // opcodes across file boundaries.
+        let pad = (4 - (solid.len() % 4)) % 4;
+        solid.resize(solid.len() + pad, 0);
+        r.entry.solid_off = solid.len() as u64;
+        r.entry.solid_size = blob.len() as u64;
+        solid.extend_from_slice(&blob);
+        entries.push(r.entry);
+    }
+    entries.extend(others);
     if entries.is_empty() {
         return Err(Error::Manifest("nothing to pack".to_string()));
     }

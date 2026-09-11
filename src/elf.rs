@@ -23,11 +23,13 @@ pub struct Section {
     pub is_code: bool,
 }
 
-/// Parse result: sections + architecture.
+/// Parse result: sections + architecture + object type.
 #[derive(Debug)]
 pub struct ElfInfo {
     pub sections: Vec<Section>,
     pub arch: Arch,
+    /// Raw `e_type`: 2 = executable, 3 = shared object, 1 = relocatable.
+    pub e_type: u16,
 }
 
 const EM_X86_64: u16 = 62;
@@ -123,5 +125,9 @@ pub fn parse(data: &[u8]) -> Option<ElfInfo> {
     }
 
     sections.sort_by_key(|s| s.offset);
-    Some(ElfInfo { sections, arch })
+    Some(ElfInfo {
+        sections,
+        arch,
+        e_type: u16le(data, 16),
+    })
 }
