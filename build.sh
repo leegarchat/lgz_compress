@@ -254,8 +254,18 @@ build_target() {
         local push_bin="$PUSH_DIR/${BIN_NAME}_${short_arch}"
         cp "$src_bin" "$push_bin"
 
-        if command -v strip &>/dev/null; then
-            strip "$push_bin" 2>/dev/null || true
+        # Cross-strip: host `strip` silently fails on foreign ELFs,
+        # leaving debug sections in place. Pick the matching binutils.
+        local strip_tool=""
+        case "$target" in
+            "$TARGET_ARM64") strip_tool="aarch64-linux-gnu-strip" ;;
+            "$TARGET_ARM32") strip_tool="arm-linux-gnueabihf-strip" ;;
+            "$TARGET_X86")   strip_tool="i686-linux-gnu-strip" ;;
+            "$TARGET_X64")   strip_tool="strip" ;;
+        esac
+
+        if [[ -n "$strip_tool" ]] && command -v "$strip_tool" &>/dev/null; then
+            "$strip_tool" --strip-all -R .comment -R .note* "$push_bin" 2>/dev/null || true
         fi
 
         local push_size
