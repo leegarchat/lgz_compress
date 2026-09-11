@@ -1,9 +1,12 @@
-//! Archive decompression.
+//! Archive decompression (UCOMP01 single-blob files).
 //!
 //! Direct port of `decompress_file` from lgzv3.c, including the per-type
 //! post-processing (types 1-6 invert the matching preprocessing).
 //! For blob types 3/4/6 the ELF section table is re-parsed from the
 //! decompressed data to locate code ranges — exactly like C.
+//!
+//! [`decompress_bytes`] is shared with the multi-file unpacker, which
+//! decodes the solid UCOMP01 payload of a UCOMP02 container.
 
 use std::fs;
 
@@ -105,16 +108,9 @@ fn undo_preproc(mut payload: Vec<u8>, preproc: u8) -> Result<Vec<u8>, Error> {
     }
 }
 
-/// Decompress `in_path` into `out_path`.
-pub fn decompress_file(in_path: &str, out_path: &str) -> Result<(), Error> {
-    let data = fs::read(in_path)?;
-    let header = format::parse_header(&data)?;
-    println!(
-        "[*] Распаковка: {} блоков, исходный размер {} байт",
-        header.chunks.len(),
-        header.orig_size
-    );
-
+/// Decompress a UCOMP01 archive image into raw bytes.
+pub fn decompress_bytes(data: &[u8]) -> Result<Vec<u8>, Error> {
+    let header = format::parse_header(data)?;
     let mut output = Vec::with_capacity(header.orig_size as usize);
     for (i, (meta, range)) in header.chunks.iter().enumerate() {
         let payload = lzma::decompress_buf(&data[range.clone()], meta.orig_size as usize)
@@ -130,8 +126,23 @@ pub fn decompress_file(in_path: &str, out_path: &str) -> Result<(), Error> {
     if output.len() as u64 != header.orig_size {
         return Err(Error::BadArchive("output size mismatch".to_string()));
     }
+    Ok(output)
+}
 
+/// Decompress a UCOMP01 archive file into `out_path`.
+pub fn decompress_file(in_path: &str, out_path: &str) -> Result<(), Error> {
+    let data = fs::read(in_path)?;
+    if data.len() < 8 || &data[0..8] != format::MAGIC {
+        return Err(Error::BadArchive(
+            "not a single-file archive (magic mismatch)".to_string(),
+        ));
+    }
+    let output = decompress_bytes(&data)?;
+    println!(
+        "[*] Decompressing: {} bytes of original data",
+        output.len()
+    );
     fs::write(out_path, &output)?;
-    println!("[+] Успешно распаковано: {} байт", header.orig_size);
+    println!("[+] Decompressed OK: {} bytes", output.len());
     Ok(())
 }

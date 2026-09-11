@@ -1,60 +1,145 @@
-//! Batch decompression from a manifest file.
+//! Build manifest parsing.
 //!
-//! Direct port of `decompress_all` from lgzv3.c. The manifest is a text
-//! file with lines `<octal perms> <path>`; `#` comments and blank lines
-//! are skipped. Each archive is decompressed to `<path>.lgz_tmp`, then
-//! renamed over the original and `chmod`-ed to the listed permissions.
+//! The manifest is a plain text file listing the tree to pack. Line format:
+//! ```text
+//! file <path> [chmod] [owner] [context]
+//! dir  <path> [chmod] [owner] [context]
+//! link <path> -> <target> [chmod] [owner] [context]
+//! ```
+//! - `#` comments and blank lines are ignored;
+//! - `<path>` is relative to the current directory at pack time;
+//! - metadata fields are positional (`-` skips one);
+//! - `chmod` accepts octal (`755`, `0755`) or symbolic (`rwxr-xr-x`);
+//! - `owner` accepts `user`, `uid`, `user:group`, `uid:gid` and mixes;
+//! - `context` is a SELinux string (`u:object_r:system_file:s0`).
 
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::collections::HashSet;
 
-use crate::decompress::decompress_file;
 use crate::error::Error;
+use crate::meta::{self, FileMeta};
 
-/// Decompress every archive listed in the manifest file.
-pub fn decompress_all(manifest_path: &str) -> Result<(), Error> {
-    let text = fs::read_to_string(manifest_path)?;
-    let mut ok_count = 0;
-    let mut fail_count = 0;
+/// Entry type requested by the manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    File,
+    Dir,
+    Link,
+}
 
-    for line in text.lines() {
+/// One parsed manifest line.
+#[derive(Debug, Clone)]
+pub struct ManifestEntry {
+    pub kind: EntryKind,
+    pub path: String,
+    /// Symlink target (only for `Link`).
+    pub target: Option<String>,
+    /// Metadata parsed from the line (partial is fine).
+    pub meta: FileMeta,
+    /// 1-based line number, for error messages.
+    pub line_no: usize,
+}
+
+fn parse_meta_slots(
+    slots: &[&str],
+    line_no: usize,
+    raw: &str,
+) -> Result<FileMeta, Error> {
+    if slots.len() > 3 {
+        return Err(Error::Manifest(format!(
+            "line {line_no}: too many fields: {raw}"
+        )));
+    }
+    let mut meta = FileMeta::empty();
+    let get = |i: usize| slots.get(i).copied().unwrap_or("-");
+    let chmod_s = get(0);
+    let owner_s = get(1);
+    let context_s = get(2);
+
+    if chmod_s != "-" {
+        meta.mode = Some(meta::parse_mode(chmod_s).map_err(|e| {
+            Error::Manifest(format!("line {line_no}: {e}"))
+        })?);
+    }
+    if owner_s != "-" {
+        let (uid, gid) = meta::parse_owner(owner_s)
+            .map_err(|e| Error::Manifest(format!("line {line_no}: {e}")))?;
+        meta.uid = uid;
+        meta.gid = gid;
+    }
+    if context_s != "-" {
+        meta.context = Some(
+            meta::parse_context(context_s)
+                .map_err(|e| Error::Manifest(format!("line {line_no}: {e}")))?,
+        );
+    }
+    Ok(meta)
+}
+
+/// Parse manifest text into entry specs.
+pub fn parse_manifest(text: &str) -> Result<Vec<ManifestEntry>, Error> {
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+
+    for (idx, line) in text.lines().enumerate() {
+        let line_no = idx + 1;
         let line = line.strip_suffix('\r').unwrap_or(line);
+        let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some((perms_str, path)) = line.split_once(' ') else {
-            eprintln!("[LGZ] Неверный формат строки: {line}");
-            continue;
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.len() < 2 {
+            return Err(Error::Manifest(format!("line {line_no}: bad entry: {line}")));
+        }
+        let kind = match tokens[0] {
+            "file" => EntryKind::File,
+            "dir" => EntryKind::Dir,
+            "link" => EntryKind::Link,
+            other => {
+                return Err(Error::Manifest(format!(
+                    "line {line_no}: bad type '{other}' (want file/dir/link)"
+                )));
+            }
         };
-        let perms = u32::from_str_radix(perms_str, 8).unwrap_or(0o644);
-        if fs::metadata(path).is_err() {
-            eprintln!("[LGZ] Файл не найден: {path}");
-            fail_count += 1;
-            continue;
+        let path = tokens[1].to_string();
+        if path.is_empty() {
+            return Err(Error::Manifest(format!("line {line_no}: empty path")));
         }
 
-        let tmp_path = format!("{path}.lgz_tmp");
-        println!("[LGZ] Распаковка: {path}");
-        if decompress_file(path, &tmp_path).is_err() {
-            eprintln!("[LGZ] Ошибка при распаковке: {path}");
-            let _ = fs::remove_file(&tmp_path);
-            fail_count += 1;
-            continue;
+        let (target, slots) = if kind == EntryKind::Link {
+            if tokens.get(2) != Some(&"->") || tokens.len() < 4 {
+                return Err(Error::Manifest(format!(
+                    "line {line_no}: link needs 'link <path> -> <target>'"
+                )));
+            }
+            (Some(tokens[3].to_string()), &tokens[4..])
+        } else {
+            if tokens.get(2) == Some(&"->") {
+                return Err(Error::Manifest(format!(
+                    "line {line_no}: '->' is only valid for link entries"
+                )));
+            }
+            (None, &tokens[2..])
+        };
+
+        if !seen.insert(path.clone()) {
+            return Err(Error::Manifest(format!(
+                "line {line_no}: duplicate path '{path}'"
+            )));
         }
-        if fs::rename(&tmp_path, path).is_err() {
-            eprintln!("[LGZ] Ошибка при замене оригинального файла: {path}");
-            let _ = fs::remove_file(&tmp_path);
-            fail_count += 1;
-            continue;
-        }
-        if fs::set_permissions(path, fs::Permissions::from_mode(perms)).is_err() {
-            eprintln!("[LGZ] Ошибка chmod: {path}");
-            fail_count += 1;
-            continue;
-        }
-        ok_count += 1;
+
+        let meta = parse_meta_slots(slots, line_no, line)?;
+        entries.push(ManifestEntry {
+            kind,
+            path,
+            target,
+            meta,
+            line_no,
+        });
     }
 
-    println!("[LGZ] Завершено: {ok_count} успешно, {fail_count} с ошибками");
-    Ok(())
+    if entries.is_empty() {
+        return Err(Error::Manifest("manifest lists no entries".to_string()));
+    }
+    Ok(entries)
 }

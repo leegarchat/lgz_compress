@@ -11,6 +11,7 @@ name = "lgz_compress"
 path = "src/main.rs"
 
 [dependencies]
+libc = "0.2"
 lzma-rust2 = "0.20"
 rayon = "1.10"
 

@@ -1,13 +1,17 @@
 //! Whole-file compression pipeline.
 //!
-//! Direct port of `compress_file` from lgzv3.c:
-//! ELF-aware chunking, parallel multi-block compression, parallel
-//! single-blob brute force over (preprocessing x lc/lp/pb), then the
-//! smaller of the two layouts wins. `rayon` thread pools replace OpenMP.
+//! Direct port of `compress_file` from lgzv3.c: ELF-aware chunking, parallel
+//! multi-block compression, parallel single-blob brute force over
+//! (preprocessing x lc/lp/pb), then the smaller of the two layouts wins.
+//! `rayon` thread pools replace OpenMP.
 //!
 //! The `if (0 && ...)` shortlist block from C never executes and is not
-//! ported. Files larger than 4 GiB are rejected (C silently truncated them
+//! ported. Inputs larger than 4 GiB are rejected (C silently truncated them
 //! to 32 bits in chunk headers).
+//!
+//! [`compress_data`] is also used by the multi-file packer: it compresses
+//! an opaque solid blob (per-file normalization already applied by the
+//! caller) as one plain chunk plus the single-blob brute force.
 
 use std::fs;
 use std::io::Write as _;
@@ -24,10 +28,10 @@ use crate::{delta, lzma, normalize, planes};
 
 /// One file region handed to the multi-block path.
 #[derive(Debug, Clone, Copy)]
-struct Chunk {
-    off: usize,
-    size: usize,
-    is_code: bool,
+pub struct Chunk {
+    pub off: usize,
+    pub size: usize,
+    pub is_code: bool,
 }
 
 /// Smart (lc, lp, pb) table for level 2. Port of `smart_combos`.
@@ -57,22 +61,48 @@ const LCS: [u32; 5] = [3, 0, 1, 2, 4];
 const LPS: [u32; 3] = [0, 1, 2];
 const PBS: [u32; 3] = [2, 0, 1];
 
-fn hw_threads() -> usize {
+/// Number of worker threads to use by default (all online cores).
+pub fn hw_threads() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+}
+
+/// Job settings shared by single-file compression and the solid packer.
+#[derive(Debug, Clone, Copy)]
+pub struct CompressOpts {
+    /// Optimization level 0-3.
+    pub level: u8,
+    /// Worker thread count (already resolved, >= 1).
+    pub threads: usize,
+    /// Suppress progress lines (the packer prints its own summary).
+    pub quiet: bool,
 }
 
 /// Split the file into chunks along ELF PROGBITS sections.
 ///
 /// Gaps between sections become plain chunks; without ELF (or without
 /// sections) the whole file is a single plain chunk.
-fn build_chunks(data: &[u8]) -> (Vec<Chunk>, Option<Arch>) {
+pub fn build_chunks(data: &[u8]) -> (Vec<Chunk>, Option<Arch>) {
     let Some(info) = elf::parse(data) else {
-        return (vec![Chunk { off: 0, size: data.len(), is_code: false }], None);
+        return (
+            vec![Chunk {
+                off: 0,
+                size: data.len(),
+                is_code: false,
+            }],
+            None,
+        );
     };
     if info.sections.is_empty() {
-        return (vec![Chunk { off: 0, size: data.len(), is_code: false }], Some(info.arch));
+        return (
+            vec![Chunk {
+                off: 0,
+                size: data.len(),
+                is_code: false,
+            }],
+            Some(info.arch),
+        );
     }
     let mut chunks = Vec::new();
     let mut pos: u64 = 0;
@@ -94,22 +124,21 @@ fn build_chunks(data: &[u8]) -> (Vec<Chunk>, Option<Arch>) {
     if pos < data.len() as u64 {
         chunks.push(Chunk {
             off: pos as usize,
-            size: data.len() as usize - pos as usize,
+            size: data.len() - pos as usize,
             is_code: false,
         });
     }
     (chunks, Some(info.arch))
 }
 
-fn chunk_thread_count(opt_level: u8, file_size: usize, hw: usize) -> usize {
-    let mut ct = 1;
-    if opt_level >= 3 {
-        ct = hw;
-    } else if opt_level == 2 {
-        ct = hw.min(8);
-    } else if opt_level == 1 {
-        ct = hw.min(3);
-    }
+fn chunk_thread_count(opt_level: u8, file_size: usize, threads: usize) -> usize {
+    // NOTE: unlike the C version (which capped workers at 3/8), all cores
+    // are used: pass results are picked deterministically, so the thread
+    // count affects speed, never the output bytes.
+    let mut ct = match opt_level {
+        0 => 1,
+        _ => threads,
+    };
     if opt_level == 2 && file_size < (1 << 20) && ct > 4 {
         ct = 4;
     }
@@ -199,11 +228,7 @@ fn build_modes(
         modes.push((buffers.len() - 1, 3));
     }
     if opt_level >= 3 {
-        for (buf, typ) in [
-            (adv, 4u8),
-            (total_delta, 5u8),
-            (norm_total_delta, 6u8),
-        ] {
+        for (buf, typ) in [(adv, 4u8), (total_delta, 5u8), (norm_total_delta, 6u8)] {
             if let Some(buf) = buf {
                 buffers.push(buf);
                 modes.push((buffers.len() - 1, typ));
@@ -244,45 +269,45 @@ fn build_combos(opt_level: u8) -> Vec<(u32, u32, u32)> {
         }
         combos
     } else if opt_level >= 2 {
-        SMART_COMBOS.iter().map(|&[lc, lp, pb]| (lc, lp, pb)).collect()
+        SMART_COMBOS
+            .iter()
+            .map(|&[lc, lp, pb]| (lc, lp, pb))
+            .collect()
     } else {
         vec![(3, 0, 2)]
     }
 }
 
-/// Compress `in_path` into `out_path` at the given optimization level (0-3).
-pub fn compress_file(in_path: &str, out_path: &str, opt_level: u8) -> Result<(), Error> {
-    let data = fs::read(in_path)?;
+/// Compress raw bytes into a complete UCOMP01 archive image.
+///
+/// `chunks`/`arch` describe the data (ELF section layout for single files,
+/// one plain chunk for opaque/packed blobs).
+pub fn compress_data(
+    data: &[u8],
+    chunks: Vec<Chunk>,
+    arch: Option<Arch>,
+    opts: &CompressOpts,
+) -> Result<Vec<u8>, Error> {
     let file_size = data.len();
     if file_size > u32::MAX as usize {
         return Err(Error::TooLarge("input exceeds 4 GiB".to_string()));
     }
-    println!("[*] Входной файл: {in_path} ({file_size} байт)");
-
-    let (chunks, arch) = build_chunks(&data);
+    let opt_level = opts.level;
+    let quiet = opts.quiet;
+    let threads = opts.threads.max(1);
     let is_elf = arch.is_some();
-    if is_elf {
-        println!(
-            "[*] Обнаружен ELF. Архитектура: {}",
-            if arch == Some(Arch::Arm64) {
-                "ARM64"
-            } else {
-                "x86 / x86_64"
-            }
-        );
-    }
-
-    let hw = hw_threads();
 
     // ---- Multi-block path (levels 1-3). ----
     let mut multi_results: Option<Vec<ChunkResult>> = None;
     let mut multi_total = usize::MAX;
     if opt_level > 0 {
-        println!(
-            "[*] Сжатие мульти-блоком ({} чанков). Используются все ядра CPU...",
-            chunks.len()
-        );
-        let ct = chunk_thread_count(opt_level, file_size, hw);
+        if !quiet {
+            println!(
+                "[*] Multi-block compression ({} chunks). Using all CPU cores...",
+                chunks.len()
+            );
+        }
+        let ct = chunk_thread_count(opt_level, file_size, threads);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(ct)
             .build()
@@ -298,28 +323,31 @@ pub fn compress_file(in_path: &str, out_path: &str, opt_level: u8) -> Result<(),
         let results = results?;
         let payload: usize = results.iter().map(ChunkResult::comp_size).sum();
         multi_total = 8 + 8 + 4 + chunks.len() * (1 + 4 + 4) + payload;
-        println!("[*] Мульти-блочный метод: {multi_total} байт");
+        if !quiet {
+            println!("[*] Multi-block result: {multi_total} bytes");
+        }
         multi_results = Some(results);
     }
 
     // ---- Single-blob brute force. ----
-    let (buffers, modes) = build_modes(data, &chunks, arch, is_elf, opt_level);
+    let (buffers, modes) = build_modes(data.to_vec(), &chunks, arch, is_elf, opt_level);
     let combos = build_combos(opt_level);
     let total_passes = combos.len() * modes.len();
 
-    let mut bf_threads = hw;
-    if opt_level == 2 {
-        bf_threads = hw.min(8);
-    } else if opt_level <= 1 && bf_threads > 6 {
-        bf_threads = 6;
-    }
+    let mut bf_threads = threads;
     bf_threads = bf_threads.min(total_passes).max(1);
-    println!(
-        "[*] Запуск ОПТИМИЗАТОРА (Уровень: {opt_level} | Потоков: {bf_threads} | Комбинаций: {total_passes})"
-    );
+    if !quiet {
+        println!(
+            "[*] Running optimizer (level: {opt_level} | threads: {bf_threads} | combinations: {total_passes})"
+        );
+    }
 
     let done = AtomicUsize::new(0);
-    let report_step = if total_passes >= 20 { total_passes / 20 } else { 1 };
+    let report_step = if total_passes >= 20 {
+        total_passes / 20
+    } else {
+        1
+    };
     // (payload size, pass index, payload, preproc type). Lower size wins,
     // ties keep the earlier pass — same rule as C's critical section.
     let best: Mutex<Option<(usize, usize, Vec<u8>, u8)>> = Mutex::new(None);
@@ -347,14 +375,14 @@ pub fn compress_file(in_path: &str, out_path: &str, opt_level: u8) -> Result<(),
                 }
             }
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if total_passes > 2 && (n == total_passes || n % report_step == 0) {
-                print!("\r    Анализ вариантов: {n} / {total_passes} ...");
+            if !quiet && total_passes > 2 && (n == total_passes || n % report_step == 0) {
+                print!("\r    Trying variants: {n} / {total_passes} ...");
                 let _ = std::io::stdout().flush();
             }
         });
     });
-    if total_passes > 2 {
-        println!("\r    Анализ вариантов: {total_passes} / {total_passes} ... Готово!    ");
+    if !quiet && total_passes > 2 {
+        println!("\r    Trying variants: {total_passes} / {total_passes} ... Done!    ");
     }
     let (_size, _pass, best_comp, best_type) = best
         .into_inner()
@@ -362,12 +390,18 @@ pub fn compress_file(in_path: &str, out_path: &str, opt_level: u8) -> Result<(),
         .ok_or_else(|| Error::Lzma("single-blob optimizer found nothing".to_string()))?;
 
     let single_total = 8 + 8 + 4 + 1 + 4 + 4 + best_comp.len();
-    println!("[*] Лучший результат единым блоком: {single_total} байт (препроцессинг: {best_type})");
+    if !quiet {
+        println!(
+            "[*] Best single-blob result: {single_total} bytes (preprocessing: {best_type})"
+        );
+    }
 
     // ---- Emit the winner. ----
     let mut out = Vec::new();
     if single_total < multi_total {
-        println!("[*] Выбран метод единого блока (максимальное сжатие)");
+        if !quiet {
+            println!("[*] Selected single-blob layout (max compression)");
+        }
         let metas = [ChunkMeta {
             preproc: best_type,
             orig_size: file_size as u32,
@@ -376,7 +410,9 @@ pub fn compress_file(in_path: &str, out_path: &str, opt_level: u8) -> Result<(),
         out.extend_from_slice(&format::encode_header(file_size as u64, &metas));
         out.extend_from_slice(&best_comp);
     } else {
-        println!("[*] Выбран мульти-блочный метод");
+        if !quiet {
+            println!("[*] Selected multi-block layout");
+        }
         let results = multi_results.expect("multi path must exist when it wins");
         let metas: Vec<ChunkMeta> = results
             .iter()
@@ -391,11 +427,43 @@ pub fn compress_file(in_path: &str, out_path: &str, opt_level: u8) -> Result<(),
             out.extend_from_slice(&r.compressed);
         }
     }
+    Ok(out)
+}
+
+/// Compress `in_path` into `out_path`.
+pub fn compress_file(
+    in_path: &str,
+    out_path: &str,
+    opt_level: u8,
+    threads: usize,
+) -> Result<(), Error> {
+    let data = fs::read(in_path)?;
+    let file_size = data.len();
+    println!("[*] Input file: {in_path} ({file_size} bytes)");
+
+    let (chunks, arch) = build_chunks(&data);
+    if arch.is_some() {
+        println!(
+            "[*] ELF detected. Architecture: {}",
+            if arch == Some(Arch::Arm64) {
+                "ARM64"
+            } else {
+                "x86 / x86_64"
+            }
+        );
+    }
+
+    let opts = CompressOpts {
+        level: opt_level,
+        threads: threads.max(1),
+        quiet: false,
+    };
+    let out = compress_data(&data, chunks, arch, &opts)?;
     fs::write(out_path, &out)?;
 
     let out_size = out.len();
     println!(
-        "\n[+] РЕЗУЛЬТАТ: {file_size} -> {out_size} байт ({:.2}%)",
+        "\n[+] RESULT: {file_size} -> {out_size} bytes ({:.2}%)",
         100.0 * out_size as f64 / file_size.max(1) as f64
     );
     Ok(())

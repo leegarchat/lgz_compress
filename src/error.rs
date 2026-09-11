@@ -1,9 +1,6 @@
 //! Shared error type for the utility.
 //!
-//! Port of the C version, where errors were printed via `perror`/`fprintf`
-//! and the function returned `void`. In the Rust version errors propagate
-//! to the caller, and `main` exits with code 1 (intentional deviation
-//! from C, where the exit code was always 0).
+//! I/O and codec errors propagate to the caller; `main` exits with code 1.
 
 use std::fmt;
 use std::io;
@@ -19,15 +16,24 @@ pub enum Error {
     BadArchive(String),
     /// Limit exceeded (file size, dictionary, chunk).
     TooLarge(String),
+    /// Metadata error (mode/owner/context parsing or application).
+    Meta(String),
+    /// Manifest error (syntax, missing files, unsafe paths).
+    Manifest(String),
+    /// Command-line usage error.
+    Usage(String),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Io(e) => write!(f, "{e}"),
-            Error::Lzma(e) => write!(f, "ошибка LZMA2: {e}"),
-            Error::BadArchive(e) => write!(f, "неверный архив: {e}"),
-            Error::TooLarge(e) => write!(f, "превышен лимит: {e}"),
+            Error::Lzma(e) => write!(f, "LZMA2 error: {e}"),
+            Error::BadArchive(e) => write!(f, "bad archive: {e}"),
+            Error::TooLarge(e) => write!(f, "limit exceeded: {e}"),
+            Error::Meta(e) => write!(f, "metadata error: {e}"),
+            Error::Manifest(e) => write!(f, "manifest error: {e}"),
+            Error::Usage(e) => write!(f, "{e}"),
         }
     }
 }
