@@ -1,34 +1,15 @@
 //! ARM64 / x86 branch normalization.
 //!
 //! Direct port of `arm64_branch_normalize/denormalize` and
-//! `x86_branch_normalize/denormalize` from lgzv3.c, extended with 19-bit
-//! PC-relative ARM64 instructions (LDR literal, B.cond, CBZ/CBNZ).
-//! Relative addresses/targets become absolute (and back), which makes code
+//! `x86_branch_normalize/denormalize` from lgzv3.c.
+//! Relative branch addresses become absolute (and back), which makes code
 //! more compressible. Arithmetic uses explicit `wrapping_*`, matching
 //! `uint32_t`/`int32_t` overflow semantics in C.
-//!
-//! The transform is an exact involution per 4-byte word: any word matching
-//! a mask is rewritten on normalize and restored on denormalize, so even a
-//! coincidental mask hit inside data can never corrupt bytes.
 
-/// Sign-extend a 19-bit immediate to i32.
-fn sign19(v: u32) -> i32 {
-    let mut s = v & 0x7_FFFF;
-    if s & 0x4_0000 != 0 {
-        s |= 0xFFF8_0000;
-    }
-    s as i32
-}
-
-/// ARM64: relative B/BL, ADRP, LDR-literal, B.cond, CBZ/CBNZ -> absolute.
+/// ARM64: relative B/BL and ADRP addresses -> absolute.
 ///
 /// Processes 4-byte little-endian instructions:
-/// - `B`/`BL` (opcode_top 0x05/0x25): signed 26-bit word offset;
-/// - `ADRP` (mask 0x9F000000 == 0x90000000): signed 21-bit page offset;
-/// - `LDR` (literal family, mask 0x3B000000 == 0x18000000): signed 19-bit
-///   word offset to the literal pool;
-/// - `B.cond` (mask 0xFF000010 == 0x54000000): signed 19-bit word offset;
-/// - `CBZ`/`CBNZ` (mask 0x7E000000 == 0x34000000): signed 19-bit word offset.
+/// `B`/`BL` (opcode_top 0x05/0x25), `ADRP` (mask 0x9F000000 == 0x90000000).
 pub fn arm64_normalize(data: &mut [u8]) {
     let size = data.len();
     let mut i = 0;
@@ -60,13 +41,6 @@ pub fn arm64_normalize(data: &mut [u8]) {
             let new_immlo = page & 0x3;
             new_instr = (instr & 0x9F00_001F) | (new_immhi << 5) | (new_immlo << 29);
             modified = true;
-        } else if is_pc_rel_19(instr) {
-            // LDR literal / B.cond / CBZ / CBNZ: signed 19-bit word offset
-            // from the instruction word to the target word.
-            let imm19 = sign19((instr >> 5) & 0x7_FFFF);
-            let abs_word = ((i / 4) as i32).wrapping_add(imm19) as u32;
-            new_instr = (instr & 0xFF00_001F) | ((abs_word & 0x7_FFFF) << 5);
-            modified = true;
         }
 
         if modified {
@@ -76,17 +50,7 @@ pub fn arm64_normalize(data: &mut [u8]) {
     }
 }
 
-/// True for 19-bit PC-relative words: LDR (literal family), B.cond,
-/// CBZ/CBNZ. The three masks are disjoint from each other and from the
-/// B/BL and ADRP patterns above.
-fn is_pc_rel_19(instr: u32) -> bool {
-    instr & 0x3B00_0000 == 0x1800_0000  // LDR literal family
-        || instr & 0xFF00_0010 == 0x5400_0000 // B.cond
-        || instr & 0x7E00_0000 == 0x3400_0000 // CBZ / CBNZ
-}
-
-/// ARM64: absolute B/BL, ADRP, LDR-literal, B.cond, CBZ/CBNZ addresses
-/// -> relative (inverse operation).
+/// ARM64: absolute B/BL and ADRP addresses -> relative (inverse operation).
 pub fn arm64_denormalize(data: &mut [u8]) {
     let size = data.len();
     let mut i = 0;
@@ -115,14 +79,6 @@ pub fn arm64_denormalize(data: &mut [u8]) {
             let new_immhi = (rel >> 2) & 0x7_FFFF;
             let new_immlo = rel & 0x3;
             new_instr = (instr & 0x9F00_001F) | (new_immhi << 5) | (new_immlo << 29);
-            modified = true;
-        } else if is_pc_rel_19(instr) {
-            let mut abs_word = (instr >> 5) & 0x7_FFFF;
-            if abs_word & 0x4_0000 != 0 {
-                abs_word |= 0xFFF8_0000;
-            }
-            let rel = (abs_word as i32).wrapping_sub((i / 4) as i32) as u32;
-            new_instr = (instr & 0xFF00_001F) | ((rel & 0x7_FFFF) << 5);
             modified = true;
         }
 
@@ -167,33 +123,6 @@ pub fn x86_denormalize(data: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn w(v: u32) -> [u8; 4] {
-        v.to_le_bytes()
-    }
-
-    /// New 19-bit families round-trip and actually transform.
-    #[test]
-    fn pc_rel_19_roundtrip() {
-        let mut data = Vec::new();
-        for v in [
-            0x5800_0040, // LDR x0, [PC, #8]
-            0x1800_00A0, // LDR w0, [PC, #20]
-            0x5400_0020, // B.EQ #4
-            0x54FF_FFE1, // B.NE #-4
-            0x3400_0040, // CBZ w0, #8
-            0xB500_0080, // CBNZ x0, #16
-            0x9400_0400, // BL (old family, control)
-            0x9000_0000, // ADRP (old family, control)
-        ] {
-            data.extend_from_slice(&w(v));
-        }
-        let orig = data.clone();
-        arm64_normalize(&mut data);
-        assert_ne!(data, orig, "masks must hit the test words");
-        arm64_denormalize(&mut data);
-        assert_eq!(data, orig);
-    }
 
     /// Involution holds for arbitrary bytes (mask hits are self-inverse).
     #[test]
