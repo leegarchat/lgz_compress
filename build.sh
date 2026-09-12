@@ -46,11 +46,12 @@ Examples:
 Outputs:
   dist/                      Static binaries lgz_compress-linux-*
                              (full build: compress + pack + unpack)
-  target/push/               Push-ready copies {name}_{arch} (x64, x86,
-                             arm64, arm32), e.g. for: adb push
-                             target/push/lgz_compress_arm64 /data/local/
-                             (decompress-only build: unpack/inspect only,
-                             for ramdisk use on device)
+  target/push/               8 push-ready copies, both flavors per arch:
+                             {name}_full_{x64,x86,arm64,arm32} (full),
+                             {name}_lean_{x64,x86,arm64,arm32}
+                             (decompress-only: unpack/inspect for ramdisk),
+                             e.g. for: adb push
+                             target/push/lgz_compress_lean_arm64 /data/local/
 EOF
     exit 0
 }
@@ -243,16 +244,25 @@ build_target() {
 
     # 2) Decompress-only build (--no-default-features): lean binary for
     # adb push to the device (ramdisk only unpacks/inspects).
-    # Post-process: adb-push-ready copy as target/push/{name}_{arch}
-    # (e.g. target/push/lgz_compress_arm64 for `adb push` to
-    # /data/local on devices). target/ is gitignored; push/ is kept
-    # across runs (only overwritten per built arch).
+    # Post-process: adb-push-ready copies into target/push/ — BOTH flavors:
+    #   {name}_full_{arch}  full build (compress + unpack, host work)
+    #   {name}_lean_{arch}  decompress-only build (ramdisk on device)
+    # (e.g. `adb push target/push/lgz_compress_lean_arm64 /data/local`).
+    # target/ is gitignored; push/ is kept across runs (only overwritten
+    # per built arch).
     run_builder "$target" "--no-default-features"
 
     if [[ -f "$src_bin" ]]; then
         mkdir -p "$PUSH_DIR"
-        local push_bin="$PUSH_DIR/${BIN_NAME}_${short_arch}"
-        cp "$src_bin" "$push_bin"
+        local push_full="$PUSH_DIR/${BIN_NAME}_full_${short_arch}"
+        local push_lean="$PUSH_DIR/${BIN_NAME}_lean_${short_arch}"
+        cp "$dst_bin" "$push_full"
+
+        if command -v strip &>/dev/null; then
+            strip "$push_full" 2>/dev/null || true
+        fi
+
+        cp "$src_bin" "$push_lean"
 
         # Cross-strip: host `strip` silently fails on foreign ELFs,
         # leaving debug sections in place. Pick the matching binutils.
@@ -265,12 +275,14 @@ build_target() {
         esac
 
         if [[ -n "$strip_tool" ]] && command -v "$strip_tool" &>/dev/null; then
-            "$strip_tool" --strip-all -R .comment -R .note* "$push_bin" 2>/dev/null || true
+            "$strip_tool" --strip-all -R .comment -R .note* "$push_lean" 2>/dev/null || true
         fi
 
-        local push_size
-        push_size=$(stat -c%s "$push_bin" 2>/dev/null || stat -f%z "$push_bin")
-        echo "Push copy: $push_bin ($push_size bytes) [decompress-only]"
+        local full_size lean_size
+        full_size=$(stat -c%s "$push_full" 2>/dev/null || stat -f%z "$push_full")
+        lean_size=$(stat -c%s "$push_lean" 2>/dev/null || stat -f%z "$push_lean")
+        echo "Push copy: $push_full ($full_size bytes) [full]"
+        echo "Push copy: $push_lean ($lean_size bytes) [decompress-only]"
     else
         echo "Error: compiled binary not found: $src_bin"
         exit 1
@@ -316,7 +328,7 @@ run_builder() {
     fi
 }
 
-# Build tasks (3rd arg = short arch for target/push/{name}_{arch})
+# Build tasks (3rd arg = short arch for target/push/{name}_{full,lean}_{arch})
 case "$SELECTED_ARCH" in
     all)
         build_target "$TARGET_X64"   "linux-x86_64" "x64"
@@ -344,8 +356,8 @@ esac
 
 echo ""
 echo "============================================================"
-echo "Done! Generated binaries in dist/:"
+echo "Done! Generated binaries in dist/ (full flavor):"
 ls -lh "$DIST_DIR"
-echo "Push-ready copies in target/push/ ({name}_{arch} for adb push):"
-ls -lh "$PUSH_DIR"
+echo "Push-ready copies in target/push/ (full + decompress-only per arch):"
+ls -lh "$PUSH_DIR" | awk '{print $9, "(" $5 ")"}'
 echo "============================================================"
