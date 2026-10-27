@@ -521,12 +521,11 @@ pub fn apply_filtered(
                     return warnings;
                 }
             };
-            // Unspecified side keeps its current value.
-            let (cur_uid, cur_gid) = fs::symlink_metadata(path)
-                .map(|st| (st.uid(), st.gid()))
-                .unwrap_or((u32::MAX, u32::MAX));
-            let uid = meta.uid.unwrap_or(cur_uid);
-            let gid = meta.gid.unwrap_or(cur_gid);
+            // Unspecified side keeps its current value: POSIX chown/lchown
+            // treat (uid_t/gid_t)-1 as "leave this field alone", so no
+            // pre-stat is needed (saves one lstat per file on unpack).
+            let uid = meta.uid.unwrap_or(u32::MAX);
+            let gid = meta.gid.unwrap_or(u32::MAX);
             // SAFETY: valid path pointer, plain integer ids.
             let rc = unsafe {
                 if is_symlink {

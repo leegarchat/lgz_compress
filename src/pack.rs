@@ -604,7 +604,10 @@ pub fn parse_container(data: &[u8]) -> Result<(Vec<PackEntry>, Range<usize>), Er
 /// with no ranges.
 #[cfg(feature = "compress")]
 fn normalize_for_solid(data: &[u8]) -> (Vec<u8>, Vec<CodeRange>, Option<(Arch, u16)>) {
-    let Some(info) = elf::parse(data) else {
+    // PT_LOAD fallback included: UCOMP02 stores explicit code_ranges,
+    // so old decoders never need to re-discover sections (see
+    // `elf::parse_for_pack`). Never use it on the UCOMP01 path.
+    let Some(info) = elf::parse_for_pack(data) else {
         return (data.to_vec(), Vec::new(), None);
     };
     let arch_byte = match info.arch {
@@ -658,9 +661,9 @@ struct ZipWork {
 }
 
 /// Cluster key: arm64 executables first, then arm64 shared objects, then
-/// other ELF, then scripts, then remaining data. Names order
-/// lexicographically inside a class so related libraries (same CRT
-/// glue, similar symbols) land next to each other.
+/// other ELF, then scripts, then remaining data. The path half is
+/// refined at sort time (`pack_specs`): duplicated basenames cluster by
+/// name, unique names keep full-path order (see below).
 #[cfg(feature = "compress")]
 fn classify(path: &str, data: &[u8], elf_id: Option<(Arch, u16)>) -> (u8, String) {
     let class = match elf_id {
@@ -671,6 +674,12 @@ fn classify(path: &str, data: &[u8], elf_id: Option<(Arch, u16)>) -> (u8, String
         None => 4,
     };
     (class, path.to_lowercase())
+}
+
+/// Basename of a lowercased archive path (for duplicate detection).
+#[cfg(feature = "compress")]
+fn basename_of(lower_path: &str) -> &str {
+    lower_path.rsplit('/').next().unwrap_or(lower_path)
 }
 
 /// Heuristic zip detection for `file` manifest lines: known extensions
@@ -849,26 +858,29 @@ fn ingest_zip(
 
 /// Resolve one manifest line against the filesystem.
 ///
-/// Returns the entry (`None` for skipped special files). File contents are
-/// returned separately; the caller clusters files and lays out the solid
-/// blob afterwards.
+/// `fs_base` is the directory `spec.path` resolves against (empty for
+/// manifest mode, where paths are cwd-relative; the walked tree root
+/// for `pack <dir>`). Returns the entry (`None` for skipped special
+/// files). File contents are returned separately; the caller clusters
+/// files and lays out the solid blob afterwards.
 #[cfg(feature = "compress")]
 fn resolve_entry(
     spec: &ManifestEntry,
+    fs_base: &Path,
     opts: &PackOptions,
     input_total: &mut u64,
 ) -> Result<Option<ResolvedEntry>, Error> {
     if Path::new(&spec.path).is_absolute() {
         return Err(Error::Manifest(format!(
-            "line {}: path must be relative: '{}'",
-            spec.line_no, spec.path
+            "{}: path must be relative: '{}'",
+            spec.err_ctx(), spec.path
         )));
     }
-    let fs_path = Path::new(&spec.path);
-    let st = fs::symlink_metadata(fs_path).map_err(|e| {
+    let fs_path = fs_base.join(&spec.path);
+    let st = fs::symlink_metadata(&fs_path).map_err(|e| {
         Error::Manifest(format!(
-            "line {}: cannot stat '{}': {e}",
-            spec.line_no, spec.path
+            "{}: cannot stat '{}': {e}",
+            spec.err_ctx(), spec.path
         ))
     })?;
     let ft = st.file_type();
@@ -895,27 +907,27 @@ fn resolve_entry(
         };
         if !(ft.is_file() || ft.is_dir() || ft.is_symlink()) {
             eprintln!(
-                "[!] Warning: line {}: skipping special file '{}'",
-                spec.line_no, spec.path
+                "[!] Warning: {}: skipping special file '{}'",
+                spec.err_ctx(), spec.path
             );
             return Ok(None);
         }
         return Err(Error::Manifest(format!(
-            "line {}: '{}' is {actual}, manifest wants {expected}",
-            spec.line_no, spec.path
+            "{}: '{}' is {actual}, expected {expected}",
+            spec.err_ctx(), spec.path
         )));
     }
 
     let mut meta = spec.meta.clone();
     meta.apply_forced(&opts.forced);
-    meta::fill_preserve(&mut meta, fs_path, opts.preserve)?;
+    meta::fill_preserve(&mut meta, &fs_path, opts.preserve)?;
 
     // A `zip` line — or a `file` line pointing at zip data — is ingested:
     // inner files join the shared solid blob, the table of contents stays
     // in the entry for rebuild-on-unpack. The file is read once here and
     // reused below.
     let raw_file: Option<Vec<u8>> = match spec.kind {
-        EntryKind::File | EntryKind::Zip => Some(fs::read(fs_path)?),
+        EntryKind::File | EntryKind::Zip => Some(fs::read(&fs_path)?),
         _ => None,
     };
     if spec.kind == EntryKind::Zip
@@ -950,20 +962,21 @@ fn resolve_entry(
             (None, ranges, Some(blob), sort)
         }
         EntryKind::Link => {
-            let target = fs::read_link(fs_path)?;
+            let target = fs::read_link(&fs_path)?;
             let target = target.into_os_string().into_string().map_err(|_| {
                 Error::Manifest(format!(
-                    "line {}: non-UTF8 link target for '{}'",
-                    spec.line_no, spec.path
+                    "{}: non-UTF8 link target for '{}'",
+                    spec.err_ctx(), spec.path
                 ))
             })?;
             // The manifest target is authoritative: the archive must match
             // the described tree exactly, not whatever the disk has today.
+            // (Walked trees leave `spec.target` empty and take the disk.)
             if let Some(want) = &spec.target {
                 if want != &target {
                     return Err(Error::Manifest(format!(
-                        "line {}: link '{}' points to '{target}', manifest says '{want}'",
-                        spec.line_no, spec.path
+                        "{}: link '{}' points to '{target}', manifest says '{want}'",
+                        spec.err_ctx(), spec.path
                     )));
                 }
             }
@@ -996,14 +1009,105 @@ pub fn pack(manifest_path: &str, out_path: &str, opts: &PackOptions) -> Result<(
     let text = fs::read_to_string(manifest_path)?;
     let specs = parse_manifest(&text)?;
     println!("[*] Manifest: {} entries", specs.len());
+    pack_specs(&specs, Path::new(""), out_path, opts)
+}
 
+/// Walk `root` depth-first into manifest-equivalent entries (sorted by
+/// name inside each directory, so the archive is deterministic).
+/// Symlinks are stored, never followed. `out_abs` (the archive being
+/// written, absolutized) is skipped so `pack <dir> <dir>/out.lgz`
+/// cannot swallow itself.
+#[cfg(feature = "compress")]
+fn walk_tree(root: &Path, out_abs: &Path) -> Result<Vec<ManifestEntry>, Error> {
+    let mut specs = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut names: Vec<_> = fs::read_dir(&dir)?
+            .map(|e| e.map(|e| e.file_name()))
+            .collect::<Result<_, _>>()?;
+        names.sort();
+        let mut subdirs = Vec::new();
+        for name in names {
+            let full = dir.join(&name);
+            if full == out_abs {
+                continue;
+            }
+            let rel = full.strip_prefix(root).map_err(|_| {
+                Error::Manifest(format!("cannot relativize '{}'", full.display()))
+            })?;
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            let ft = fs::symlink_metadata(&full)?.file_type();
+            let kind = if ft.is_symlink() {
+                EntryKind::Link
+            } else if ft.is_dir() {
+                EntryKind::Dir
+            } else if ft.is_file() {
+                EntryKind::File
+            } else {
+                eprintln!("[!] Warning: skipping special file '{}'", full.display());
+                continue;
+            };
+            if kind == EntryKind::Dir {
+                subdirs.push(full);
+            }
+            specs.push(ManifestEntry::for_walk(kind, rel));
+        }
+        // Reversed push: pops come out in sorted order.
+        stack.extend(subdirs.into_iter().rev());
+    }
+    if specs.is_empty() {
+        return Err(Error::Manifest(format!(
+            "nothing to pack in '{}'",
+            root.display()
+        )));
+    }
+    Ok(specs)
+}
+
+/// Pack a whole directory tree (tar-style) into one UCOMP02 archive.
+///
+/// Entry paths are relative to `dir` (no top-level prefix); metadata
+/// flags (`--preserve-*`, `--chmod`, ...) apply exactly like in manifest
+/// mode. The output archive itself is skipped when it sits inside `dir`.
+/// `.zip` files are stored as regular files (use a manifest `zip` line
+/// for transparent ingestion).
+#[cfg(feature = "compress")]
+pub fn pack_tree(dir: &str, out_path: &str, opts: &PackOptions) -> Result<(), Error> {
+    let root = fs::canonicalize(dir)
+        .map_err(|e| Error::Manifest(format!("cannot open directory '{dir}': {e}")))?;
+    if !root.is_dir() {
+        return Err(Error::Manifest(format!("not a directory: '{dir}'")));
+    }
+    let out_abs = if Path::new(out_path).is_absolute() {
+        PathBuf::from(out_path)
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(out_path))
+            .unwrap_or_else(|_| PathBuf::from(out_path))
+    };
+    let specs = walk_tree(&root, &out_abs)?;
+    println!("[*] Tree: {} entries from '{}'", specs.len(), root.display());
+    pack_specs(&specs, &root, out_path, opts)
+}
+
+/// Shared pack pipeline over entry specs: cluster files into the solid
+/// blob, compress once, write the UCOMP02 container. `fs_base` is the
+/// filesystem root entry paths resolve against (empty = cwd, i.e.
+/// manifest mode).
+#[cfg(feature = "compress")]
+fn pack_specs(
+    specs: &[ManifestEntry],
+    fs_base: &Path,
+    out_path: &str,
+    opts: &PackOptions,
+) -> Result<(), Error> {
     let mut input_total: u64 = 0;
     let mut skipped = 0;
     let mut clustered: Vec<ResolvedEntry> = Vec::with_capacity(specs.len());
     let mut zips: Vec<ResolvedEntry> = Vec::new();
     let mut others: Vec<PackEntry> = Vec::new();
-    for spec in &specs {
-        match resolve_entry(spec, opts, &mut input_total)? {
+    for spec in specs {
+        match resolve_entry(spec, fs_base, opts, &mut input_total)? {
             Some(r) => {
                 if r.blob.is_some() {
                     clustered.push(r);
@@ -1035,7 +1139,36 @@ pub fn pack(manifest_path: &str, out_path: &str, opts: &PackOptions) -> Result<(
             pool.push((w.sort, w.blob, Back::Zip(zi, w.inner_idx)));
         }
     }
-    pool.sort_by(|a, b| a.0.cmp(&b.0));
+    // Cluster order: same-class files whose basename occurs in several
+    // directories (e.g. libcrypto.so under system/ and vendor/) sort by
+    // name so they land back-to-back in the LZMA2 window; files with a
+    // unique name keep full-path order so same-folder files stay within
+    // one dictionary window (pure basename order would scatter them).
+    let mut name_counts: std::collections::HashMap<(u8, String), usize> =
+        std::collections::HashMap::new();
+    for ((class, lower), _, _) in &pool {
+        *name_counts
+            .entry((*class, basename_of(lower).to_string()))
+            .or_insert(0) += 1;
+    }
+    pool.sort_by(|a, b| {
+        let (ca, pa) = (&a.0.0, &a.0.1);
+        let (cb, pb) = (&b.0.0, &b.0.1);
+        let ba = basename_of(pa);
+        let bb = basename_of(pb);
+        let dup_a = name_counts.get(&(*ca, ba.to_string())).copied().unwrap_or(0) > 1;
+        let dup_b = name_counts.get(&(*cb, bb.to_string())).copied().unwrap_or(0) > 1;
+        ca.cmp(cb)
+            .then_with(|| dup_b.cmp(&dup_a))
+            .then_with(|| {
+                if dup_a && dup_b {
+                    ba.cmp(bb)
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then_with(|| pa.cmp(pb))
+    });
 
     // Lay out the solid blob in clustered order (4-byte aligned: keeps
     // LZMA pos_state (pb=2) in sync with ARM64 opcodes across boundaries).
@@ -1394,8 +1527,13 @@ pub(crate) fn rebuild_zip(
                         )));
                     }
                 };
+                // Rebuilds run on the target device during unpack: level 1
+                // keeps them fast (still valid Deflate either way).
+                // Stored entries take no level (the zip crate rejects
+                // levels on Stored).
                 let options = zip::write::SimpleFileOptions::default()
                     .compression_method(method)
+                    .compression_level(if z.method == ZIP_DEFLATED { Some(1) } else { None })
                     .unix_permissions(z.unix_mode)
                     .last_modified_time(dt);
                 let raw = solid_slice(solid, z.solid_off, z.solid_size, &z.path)?;
@@ -1466,17 +1604,24 @@ pub fn unpack(arc_path: &str, dest_dir: &str, filter: &meta::MetaFilter) -> Resu
     }
 
     // Phase 1: directories (explicit + parents of files/links/zips).
-    for (e, full) in entries.iter().zip(full_paths.iter()) {
+    // Already-created parents are cached: without it every file under
+    // e.g. system/lib64/ re-stats the same prefixes (one lstat per
+    // component per file).
+    let mut created_dirs = std::collections::HashSet::new();
+    for e in &entries {
         let rel = Path::new(&e.path);
         match e.kind {
-            EntryKind::Dir => safe_mkdir_all(dest, rel)?,
+            EntryKind::Dir => {
+                if created_dirs.insert(rel.to_path_buf()) {
+                    safe_mkdir_all(dest, rel)?;
+                }
+            }
             EntryKind::File | EntryKind::Link | EntryKind::Zip => {
                 if let Some(parent) = rel.parent() {
-                    if !parent.as_os_str().is_empty() {
+                    if !parent.as_os_str().is_empty() && created_dirs.insert(parent.to_path_buf()) {
                         safe_mkdir_all(dest, parent)?;
                     }
                 }
-                let _ = full;
             }
         }
     }
@@ -1560,4 +1705,49 @@ pub fn unpack(arc_path: &str, dest_dir: &str, filter: &meta::MetaFilter) -> Resu
         }
     );
     Ok(())
+}
+
+#[cfg(all(test, feature = "compress"))]
+mod tests {
+    use super::*;
+
+    fn tree_opts() -> PackOptions {
+        PackOptions { opt_level: 0, threads: Some(1), forced: FileMeta::empty(), preserve: Preserve::default() }
+    }
+
+    #[test]
+    fn pack_dir_roundtrip() {
+        let root = std::env::temp_dir().join(format!("lgz_tree_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.txt"), b"alpha").unwrap();
+        std::fs::write(root.join("sub").join("b.bin"), vec![7u8; 300]).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("a.txt", root.join("lnk")).unwrap();
+
+        let arc = root.join("out.lgz");
+        // Output lives inside the tree: must be skipped, not swallowed.
+        pack_tree(root.to_str().unwrap(), arc.to_str().unwrap(), &tree_opts()).unwrap();
+
+        let names: Vec<String> = parse_container(&std::fs::read(&arc).unwrap())
+            .unwrap()
+            .0
+            .iter()
+            .map(|e| e.path.clone())
+            .collect();
+        assert!(names.contains(&"a.txt".to_string()), "entries: {names:?}");
+        assert!(names.contains(&"sub/b.bin".to_string()), "entries: {names:?}");
+        assert!(!names.iter().any(|n| n.ends_with("out.lgz")), "self-inclusion: {names:?}");
+        #[cfg(unix)]
+        assert!(names.contains(&"lnk".to_string()), "entries: {names:?}");
+
+        let dest = root.join("restore");
+        unpack(arc.to_str().unwrap(), dest.to_str().unwrap(), &meta::MetaFilter::all()).unwrap();
+        assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(std::fs::read(dest.join("sub").join("b.bin")).unwrap(), vec![7u8; 300]);
+        #[cfg(unix)]
+        assert_eq!(std::fs::read_link(dest.join("lnk")).unwrap().to_str().unwrap(), "a.txt");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

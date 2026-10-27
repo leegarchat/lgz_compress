@@ -111,21 +111,64 @@ fn undo_preproc(mut payload: Vec<u8>, preproc: u8) -> Result<Vec<u8>, Error> {
 /// Decompress a UCOMP01 archive image into raw bytes.
 pub fn decompress_bytes(data: &[u8]) -> Result<Vec<u8>, Error> {
     let header = format::parse_header(data)?;
-    let mut output = Vec::with_capacity(header.orig_size as usize);
-    for (i, (meta, range)) in header.chunks.iter().enumerate() {
+    // Fast path (the 99% case: single-chunk solids and single files):
+    // decode straight into the final buffer instead of allocating a
+    // throwaway payload and memcpy-ing it a second time.
+    if let [(meta, range)] = header.chunks.as_slice() {
         let payload = lzma::decompress_buf(&data[range.clone()], meta.orig_size as usize)
-            .map_err(|e| Error::Lzma(format!("block {i}: {e}")))?;
+            .map_err(|e| Error::Lzma(format!("block 0: {e}")))?;
         let plain = undo_preproc(payload, meta.preproc)?;
-        if plain.len() != meta.orig_size as usize {
-            return Err(Error::BadArchive(format!(
-                "block {i}: postproc size mismatch"
-            )));
+        if plain.len() != meta.orig_size as usize || plain.len() as u64 != header.orig_size {
+            return Err(Error::BadArchive("block 0: postproc size mismatch".to_string()));
         }
-        output.extend_from_slice(&plain);
+        return Ok(plain);
     }
-    if output.len() as u64 != header.orig_size {
-        return Err(Error::BadArchive("output size mismatch".to_string()));
+
+    let mut output = vec![0u8; header.orig_size as usize];
+    // Split the preallocated buffer into per-chunk destinations up front;
+    // chunks then decode in parallel with no further allocation or copy.
+    // (std::thread::scope: no rayon dependency, works in lean builds.)
+    let mut slices: Vec<(&mut [u8], format::ChunkMeta, &[u8], usize)> =
+        Vec::with_capacity(header.chunks.len());
+    {
+        let mut rest = output.as_mut_slice();
+        for (i, (meta, range)) in header.chunks.iter().enumerate() {
+            let (dst, tail) = rest.split_at_mut(meta.orig_size as usize);
+            rest = tail;
+            slices.push((dst, *meta, &data[range.clone()], i));
+        }
     }
+
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(slices.len());
+    let chunk_size = slices.len().div_ceil(n_threads.max(1));
+
+    std::thread::scope(|s| -> Result<(), Error> {
+        let mut handles = Vec::new();
+        for group in slices.chunks_mut(chunk_size) {
+            handles.push(s.spawn(move || -> Result<(), Error> {
+                for (dst, meta, src, i) in group {
+                    let payload = lzma::decompress_buf(src, meta.orig_size as usize)
+                        .map_err(|e| Error::Lzma(format!("block {i}: {e}")))?;
+                    let plain = undo_preproc(payload, meta.preproc)?;
+                    if plain.len() != meta.orig_size as usize {
+                        return Err(Error::BadArchive(format!(
+                            "block {i}: postproc size mismatch"
+                        )));
+                    }
+                    dst.copy_from_slice(&plain);
+                }
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join().map_err(|_| Error::Lzma("decompressor thread panicked".to_string()))??;
+        }
+        Ok(())
+    })?;
+
     Ok(output)
 }
 

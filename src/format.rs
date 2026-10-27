@@ -42,8 +42,10 @@ pub fn preproc_name(t: u8) -> &'static str {
 pub const HEADER_LEN: usize = 20;
 /// Per-chunk header length: type (1) + orig size (4) + comp size (4).
 pub const CHUNK_HDR_LEN: usize = 9;
-/// Same 256 MiB output cap as the C decoder.
-pub const MAX_OUTPUT: u64 = 256 * 1024 * 1024;
+/// Output cap: 2 GiB. The C decoder had no cap at all; 256 MiB here
+/// would silently refuse archives `compress` happily wrote (it allows
+/// up to 4 GiB), so the cap only guards against absurd allocations.
+pub const MAX_OUTPUT: u64 = 2 * 1024 * 1024 * 1024;
 
 #[cfg(feature = "compress")]
 pub fn write_u32le(buf: &mut [u8], v: u32) {
@@ -114,7 +116,7 @@ pub fn parse_header(data: &[u8]) -> Result<ArchiveHeader, Error> {
     }
     let orig_size = read_u64le(&data[8..16]);
     if orig_size > MAX_OUTPUT {
-        return Err(Error::TooLarge("original size exceeds 256 MiB".to_string()));
+        return Err(Error::TooLarge("original size exceeds 2 GiB".to_string()));
     }
     let n_chunks = read_u32le(&data[16..20]);
     if n_chunks == 0 || n_chunks > 1_000_000 {

@@ -14,7 +14,7 @@
 //! - C `level = 9, algo = 1 (normal), btMode = 1, numHashBytes = 4, fb = 273`
 //!   map to `Normal` mode, `Bt4` matcher, `nice_len = 273`;
 //! - C `mc` (match search limit 48/256/4096/500000) maps to `depth_limit`
-//!   (32/128/2048/auto). Exact search behavior differs between the two
+//!   (32/128/2048/500000). Exact search behavior differs between the two
 //!   match finders, so ratios are compared empirically, not bit-by-bit.
 
 use std::io::Read;
@@ -27,33 +27,34 @@ use lzma_rust2::{EncodeMode, Lzma2Options, Lzma2Writer, LzmaOptions, MfType};
 
 use crate::error::Error;
 
-/// Max dictionary: 16 MiB normally, 32 MiB on level 3, and 64 MiB on
-/// level 3 for inputs over 32 MiB (ramdisk-scale solids on modern devices
+/// Max dictionary: 16 MiB on level 0, 32 MiB on level 1, 64 MiB on
+/// level 2, 128 MiB on level 3 (ramdisk-scale solids on modern devices
 /// with 8-16 GB RAM). Mirrors `get_optimal_dict_size` in lgzv3.c, extended.
+/// Sizing uses exact LZMA2 half-steps (16/24/32/48/64 MiB...), so a blob
+/// just over a power of two (e.g. 18 MiB -> 24 MiB, not 32 MiB) does not
+/// waste decoder RAM, and one just under a cap keeps full coverage.
+/// A 104.5 MiB solid on level 3 gets a 128 MiB dictionary covering the
+/// whole blob instead of being cut at 64 MiB.
 /// Encode-only (`compress` feature): the decompress-only ramdisk build
 /// never sizes dictionaries.
 #[cfg(feature = "compress")]
 pub fn optimal_dict_size(in_size: u64, opt_level: u8) -> u32 {
-    let max_dict: u64 = if opt_level >= 3 {
-        if in_size > 32 * 1024 * 1024 {
-            64 * 1024 * 1024
-        } else {
-            32 * 1024 * 1024
-        }
-    } else {
-        16 * 1024 * 1024
+    let max_dict: u32 = match opt_level {
+        0 => 16 * 1024 * 1024,
+        1 => 32 * 1024 * 1024,
+        2 => 64 * 1024 * 1024,
+        _ => 128 * 1024 * 1024,
     };
-    let mut dict: u64 = 4096;
-    while dict < in_size && dict < max_dict {
-        dict <<= 1;
-    }
-    dict as u32
+    let target = (in_size.min(max_dict as u64) as u32).max(4096);
+    decode_props(dict_props_byte(target))
 }
 
 /// Match-finder depth limit per optimization level.
 ///
-/// Heuristic mapping of C's `mc` (48/256/4096/500000). `0` means automatic
-/// (derived from `nice_len`), used for the extreme level.
+/// Heuristic mapping of C's `mc` (48/256/4096/500000). The extreme level
+/// uses the C value directly: `lzma-rust2` maps `depth_limit <= 0` to a
+/// shallow automatic default (`16 + nice_len / 2` = 152), which would
+/// search 13x fewer nodes than level 2.
 /// Encode-only.
 #[cfg(feature = "compress")]
 fn depth_limit(opt_level: u8) -> i32 {
@@ -61,7 +62,7 @@ fn depth_limit(opt_level: u8) -> i32 {
         0 => 32,
         1 => 128,
         2 => 2048,
-        _ => 0,
+        _ => 500_000,
     }
 }
 
@@ -160,8 +161,8 @@ pub fn decompress_buf(input: &[u8], orig_size: usize) -> Result<Vec<u8>, Error> 
     if input.is_empty() {
         return Err(Error::Lzma("empty payload".to_string()));
     }
-    if orig_size > 256 * 1024 * 1024 {
-        return Err(Error::TooLarge("output exceeds 256 MiB".to_string()));
+    if orig_size as u64 > crate::format::MAX_OUTPUT {
+        return Err(Error::TooLarge("output exceeds 2 GiB".to_string()));
     }
     let prop = input[0];
     let dict_size = dict_size_from_props(prop)

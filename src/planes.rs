@@ -22,17 +22,48 @@ pub fn encode(data: &[u8]) -> Vec<u8> {
 }
 
 /// Unpack planes back into instructions.
+///
+/// Split-based (no bounds checks): LLVM autovectorizes the interleave
+/// (NEON `ZIP1`/`ZIP2` on ARM64, shuffles on x86).
 pub fn decode(data: &[u8]) -> Vec<u8> {
     let size = data.len();
     let n_instr = size / 4;
-    let remainder = size % 4;
     let mut out = vec![0u8; size];
-    for i in 0..n_instr {
-        out[i * 4 + 3] = data[i];
-        out[i * 4 + 2] = data[n_instr + i];
-        out[i * 4 + 1] = data[2 * n_instr + i];
-        out[i * 4] = data[3 * n_instr + i];
+    let (p3, rest) = data.split_at(n_instr);
+    let (p2, rest) = rest.split_at(n_instr);
+    let (p1, rest) = rest.split_at(n_instr);
+    let (p0, tail) = rest.split_at(n_instr);
+
+    let (out_body, out_tail) = out.split_at_mut(n_instr * 4);
+    for (dst, (((&b3, &b2), &b1), &b0)) in out_body
+        .chunks_exact_mut(4)
+        .zip(p3.iter().zip(p2.iter()).zip(p1.iter()).zip(p0.iter()))
+    {
+        dst[0] = b0;
+        dst[1] = b1;
+        dst[2] = b2;
+        dst[3] = b3;
     }
-    out[n_instr * 4..].copy_from_slice(&data[4 * n_instr..4 * n_instr + remainder]);
+    out_tail.copy_from_slice(tail);
     out
+}
+
+#[cfg(all(test, feature = "compress"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_all_lengths() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x & 0xFF) as u8
+        };
+        for len in [0, 1, 2, 3, 4, 5, 7, 8, 31, 64, 100, 1000] {
+            let data: Vec<u8> = (0..len).map(|_| next()).collect();
+            assert_eq!(decode(&encode(&data)), data, "len={len}");
+        }
+    }
 }

@@ -58,8 +58,6 @@ const SMART_COMBOS: [[u32; 3]; 19] = [
 ];
 
 const LCS: [u32; 5] = [3, 0, 1, 2, 4];
-const LPS: [u32; 3] = [0, 1, 2];
-const PBS: [u32; 3] = [2, 0, 1];
 
 /// Number of worker threads to use by default (all online cores).
 pub fn hw_threads() -> usize {
@@ -131,21 +129,15 @@ pub fn build_chunks(data: &[u8]) -> (Vec<Chunk>, Option<Arch>) {
     (chunks, Some(info.arch))
 }
 
-fn chunk_thread_count(opt_level: u8, file_size: usize, threads: usize) -> usize {
+fn chunk_thread_count(opt_level: u8, _file_size: usize, threads: usize) -> usize {
     // NOTE: unlike the C version (which capped workers at 3/8), all cores
     // are used: pass results are picked deterministically, so the thread
-    // count affects speed, never the output bytes.
-    let mut ct = match opt_level {
+    // count affects speed, never the output bytes. Level 0 is serial by
+    // design (one LZMA2 stream).
+    match opt_level {
         0 => 1,
-        _ => threads,
-    };
-    if opt_level == 2 && file_size < (1 << 20) && ct > 4 {
-        ct = 4;
+        _ => threads.max(1),
     }
-    if file_size < (1 << 20) && ct > 2 {
-        ct = 2;
-    }
-    ct.max(1)
 }
 
 /// Build the whole-file preprocessed variants and the mode table.
@@ -163,7 +155,8 @@ fn build_modes(
     let mut modes: Vec<(usize, u8)> = vec![(0, 0)];
 
     let need_adv = is_elf && arch == Some(Arch::Arm64) && opt_level >= 2;
-    let need_total_delta = opt_level >= 3 || (opt_level >= 2 && !is_elf);
+    let need_total_delta =
+        opt_level >= 3 || (opt_level >= 2 && !is_elf) || (opt_level == 1 && chunks.len() == 1);
     let need_norm_total_delta =
         opt_level >= 3 || (opt_level >= 2 && is_elf && arch == Some(Arch::X86));
 
@@ -255,18 +248,33 @@ fn build_modes(
                 modes.push((buffers.len() - 1, 6));
             }
         }
+    } else if opt_level == 1 && chunks.len() == 1 {
+        // Single-chunk level 1 runs its whole candidate set
+        // (raw/delta x (3,0,2)/(2,2,2)/(0,0,0)) here, in parallel —
+        // see the multi-block gate in `compress_data`.
+        if let Some(buf) = total_delta {
+            buffers.push(buf);
+            modes.push((buffers.len() - 1, 5));
+        }
     }
 
     (buffers, modes)
 }
 
 /// (lc, lp, pb) combination list for the given level.
+///
+/// Level 3 brute-forces every valid pair (`lc + lp <= 4`, enforced by
+/// the LZMA2 spec and checked in `lzma::compress_buf`) across pb
+/// 0..=4: 15 pairs x 5 = 75 combinations. The old cartesian product
+/// wasted a fifth of its passes on 9 invalid combos (`lc + lp > 4`,
+/// always rejected) and never tried `lp = 3/4` (8/16-byte alignment,
+/// the sweet spot for 64-bit ELF tables).
 fn build_combos(opt_level: u8) -> Vec<(u32, u32, u32)> {
     if opt_level >= 3 {
-        let mut combos = Vec::with_capacity(45);
-        for &lc in &LCS {
-            for &lp in &LPS {
-                for &pb in &PBS {
+        let mut combos = Vec::with_capacity(75);
+        for &pb in &[2, 0, 1, 3, 4] {
+            for &lc in &LCS {
+                for lp in 0..=(4 - lc) {
                     combos.push((lc, lp, pb));
                 }
             }
@@ -277,6 +285,11 @@ fn build_combos(opt_level: u8) -> Vec<(u32, u32, u32)> {
             .iter()
             .map(|&[lc, lp, pb]| (lc, lp, pb))
             .collect()
+    } else if opt_level == 1 {
+        // Same candidate set the multi-block path tries for one chunk
+        // (raw/delta x (3,0,2)/(2,2,2)/(0,0,0)); single-blob runs them
+        // in parallel instead of serially (see gate in `compress_data`).
+        vec![(3, 0, 2), (2, 2, 2), (0, 0, 0)]
     } else {
         vec![(3, 0, 2)]
     }
@@ -301,10 +314,13 @@ pub fn compress_data(
     let threads = opts.threads.max(1);
     let is_elf = arch.is_some();
 
-    // ---- Multi-block path (levels 1-3). ----
+    // ---- Multi-block path (levels 1-3, skipped for a single chunk:
+    // there the single-blob search below tries a superset of the same
+    // candidates, in parallel — the multi-block run would be pure
+    // wasted CPU repeating raw (3,0,2) a second time).
     let mut multi_results: Option<Vec<ChunkResult>> = None;
     let mut multi_total = usize::MAX;
-    if opt_level > 0 {
+    if opt_level > 0 && chunks.len() > 1 {
         if !quiet {
             println!(
                 "[*] Multi-block compression ({} chunks). Using all CPU cores...",

@@ -141,6 +141,7 @@ Lean-вариант (`--no-default-features`) вырезает кодировщ�
 
 ```bash
 lgz_compress compress <input> <output> [level] [-l N] [-j N] [meta flags]
+lgz_compress pack <manifest|dir> <output> [-l N] [-j N] [meta flags]
 lgz_compress pack <manifest> <output> [-l N] [-j N] [meta flags]
 lgz_compress decompress <archive> [dest] [--no-owner --no-context ...]
 lgz_compress list <archive>                      # алиас: ls
@@ -159,6 +160,7 @@ lgz_compress help [command|manifest]
 ```bash
 lgz_compress compress app_process64 app.lgz 2
 lgz_compress pack tree.txt system.lgz -l 1 --preserve-all
+lgz_compress pack ./system system.lgz -l 1 --preserve-all   # всё дерево без манифеста
 lgz_compress decompress system.lgz /tmp/restore --no-owner --no-context
 lgz_compress list system.lgz
 lgz_compress extract system.lgz bin/toybox /tmp/out --flatten

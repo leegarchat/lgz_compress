@@ -46,8 +46,27 @@ pub struct ManifestEntry {
     pub target: Option<String>,
     /// Metadata parsed from the line (partial is fine).
     pub meta: FileMeta,
-    /// 1-based line number, for error messages.
+    /// 1-based line number, for error messages (0 = generated, not from
+    /// a manifest line).
     pub line_no: usize,
+}
+
+# [cfg(feature = "compress")]
+impl ManifestEntry {
+    /// Entry generated from a directory walk (`pack <dir>`).
+    pub fn for_walk(kind: EntryKind, path: String) -> Self {
+        ManifestEntry { kind, path, target: None, meta: FileMeta::empty(), line_no: 0 }
+    }
+
+    /// Error location: `line N` for manifest entries, the entry path
+    /// for walked trees.
+    pub fn err_ctx(&self) -> String {
+        if self.line_no > 0 {
+            format!("line {}", self.line_no)
+        } else {
+            format!("entry '{}'", self.path)
+        }
+    }
 }
 
 # [cfg(feature = "compress")]

@@ -55,6 +55,9 @@ Commands:
                                       With metadata flags    -> UCOMP02 (1 entry).
   pack <manifest> <output>            Pack many files into one UCOMP02 archive
                                       (solid cluster: one shared LZMA2 stream).
+                                      The input is a manifest file — or a
+                                      directory, whose whole tree is packed
+                                      (tar-style, sorted entry order).
   decompress <archive> [dest]         Unpack. UCOMP01 needs <dest> file path.
                                       UCOMP02 unpacks the tree into [dest] dir
                                       (default: current directory)."
@@ -167,19 +170,23 @@ Examples:
         ),
         #[cfg(feature = "compress")]
         "pack" => println!(
-            "Usage: {program} pack <manifest> <output> [options]
+            "Usage: {program} pack <manifest|dir> <output> [options]
 
 Pack every entry listed in <manifest> (plain text, see `help manifest`)
-into one UCOMP02 archive. Regular files are normalized per-file, then
-concatenated into a single solid blob compressed once — the LZMA2
-dictionary spans file boundaries and the optimizer runs once for all
-files instead of once per file.
+— or, when the input is a directory, the whole tree under it
+(tar-style: entries relative to the directory, sorted; symlinks stored,
+never followed; the output archive itself is skipped) — into one UCOMP02
+archive. Regular files are normalized per-file, then concatenated into
+a single solid blob compressed once — the LZMA2 dictionary spans file
+boundaries and the optimizer runs once for all files instead of once
+per file.
 
   -l, --level <0-3>  Optimization level, default 2.
 
 Examples:
   {program} pack tree.txt system.lgz -l 1 --preserve-all
-  {program} pack bins.txt bins.lgz --chmod 755 --owner 0:2000"
+  {program} pack bins.txt bins.lgz --chmod 755 --owner 0:2000
+  {program} pack ./system system.lgz -l 1 --preserve-all"
         ),
         "decompress" => println!(
             "Usage: {program} decompress <archive> [dest]
@@ -255,7 +262,9 @@ Example:
   dir  system/bin 755 root:2000 u:object_r:system_file:s0
   file system/bin/toybox 755 root:2000 u:object_r:system_file:s0
   link system/bin/sh -> toybox - - -
-  file system/bin/apexd-lsof.sh - - -"
+  file system/bin/apexd-lsof.sh - - -
+
+Tip: `pack <dir>` packs a whole tree without writing a manifest."
         ),
         _ => {
             eprintln!("Unknown help topic: {cmd}");
@@ -396,15 +405,22 @@ fn cmd_pack(program: &str, args: &[String]) -> Result<(), Error> {
     let (pos, flag_level, flag_threads, opts) = parse_common(args)?;
     if pos.len() != 2 {
         return Err(Error::Usage(format!(
-            "Usage: {program} pack <manifest> <output> [options]"
+            "Usage: {program} pack <manifest|dir> <output> [options]"
         )));
     }
-    pack::pack(&pos[0], &pos[1], &PackOptions {
+    let pack_opts = &PackOptions {
         opt_level: flag_level.unwrap_or(2),
         threads: flag_threads,
         forced: opts.forced,
         preserve: opts.preserve,
-    })
+    };
+    // A directory input packs the whole tree (tar-style); anything else
+    // is a manifest file, as before.
+    if std::path::Path::new(&pos[0]).is_dir() {
+        pack::pack_tree(&pos[0], &pos[1], pack_opts)
+    } else {
+        pack::pack(&pos[0], &pos[1], pack_opts)
+    }
 }
 
 /// Parse restore-direction flags shared by `decompress` and `extract`.
