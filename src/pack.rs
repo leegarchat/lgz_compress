@@ -52,6 +52,7 @@
 use std::fs;
 use std::io::{self, Write};
 use std::ops::Range;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -1257,24 +1258,64 @@ pub(crate) fn safe_mkdir_all(dest: &Path, rel: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// Open a file for writing, refusing to follow a trailing symlink
+/// (Zip-Slip guard). Unix uses `O_NOFOLLOW` (race-free); Windows has no
+/// equivalent, so a pre-existing link is refused upfront instead.
+fn open_nofollow(full: &Path) -> Result<fs::File, Error> {
+    #[cfg(windows)]
+    if fs::symlink_metadata(full).is_ok_and(|st| st.file_type().is_symlink()) {
+        return Err(Error::BadArchive(format!(
+            "refusing to write through symlink: '{}'",
+            full.display()
+        )));
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    opts.custom_flags(libc::O_NOFOLLOW);
+    opts.open(full).map_err(|e| {
+        #[cfg(unix)]
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            return Error::BadArchive(format!(
+                "refusing to write through symlink: '{}'",
+                full.display()
+            ));
+        }
+        Error::Io(e)
+    })
+}
+
+/// Create one symlink entry. Windows link type must match the target:
+/// a file-type link to a directory does not resolve ("The directory
+/// name is invalid"). Directories are created before links during
+/// unpack, so an existing dir target is authoritative; otherwise the
+/// trailing separator decides, files by default. Needs Developer Mode
+/// or the create-symlink privilege, otherwise the OS error propagates.
+pub(crate) fn place_symlink(target: &str, full: &Path) -> Result<(), Error> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, full)?;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+        let points_to_dir = full
+            .parent()
+            .map(|base| base.join(target))
+            .is_some_and(|p| p.is_dir())
+            || target.ends_with(['/', '\\']);
+        if points_to_dir {
+            symlink_dir(target, full)?;
+        } else {
+            symlink_file(target, full)?;
+        }
+    }
+    Ok(())
+}
+
 /// Write file bytes, refusing to follow a trailing symlink (O_NOFOLLOW).
 pub(crate) fn safe_write_file(full: &Path, bytes: &[u8]) -> Result<(), Error> {
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(full)
-        .map_err(|e| {
-            if e.raw_os_error() == Some(libc::ELOOP) {
-                Error::BadArchive(format!(
-                    "refusing to write through symlink: '{}'",
-                    full.display()
-                ))
-            } else {
-                Error::Io(e)
-            }
-        })?;
+    let mut f = open_nofollow(full)?;
     f.write_all(bytes)?;
     Ok(())
 }
@@ -1337,22 +1378,7 @@ pub(crate) fn rebuild_zip(
         }
         fs::remove_file(full)?;
     }
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(full)
-        .map_err(|e| {
-            if e.raw_os_error() == Some(libc::ELOOP) {
-                Error::BadArchive(format!(
-                    "refusing to write through symlink: '{}'",
-                    full.display()
-                ))
-            } else {
-                Error::Io(e)
-            }
-        })?;
+    let file = open_nofollow(full)?;
     let mut writer = zip::ZipWriter::new(file);
     for z in &entry.zip_inners {
         let dt = zip_datetime(&z.mtime);
@@ -1492,7 +1518,7 @@ pub fn unpack(arc_path: &str, dest_dir: &str, filter: &meta::MetaFilter) -> Resu
             }
             fs::remove_file(full)?;
         }
-        std::os::unix::fs::symlink(target, full)?;
+        place_symlink(target, full)?;
     }
 
     // Phase 3b: zip containers — rebuilt from the table of contents with

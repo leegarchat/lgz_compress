@@ -15,9 +15,12 @@
 
 use std::ffi::CString;
 use std::fs;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
+
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use crate::error::Error;
 
@@ -81,6 +84,22 @@ impl Preserve {
     }
 }
 
+/// Last OS error number for the chown/xattr paths. macOS exposes it as
+/// `__error`, every other unix as `__errno_location`.
+#[cfg(all(unix, target_os = "macos"))]
+fn last_errno() -> i32 {
+    // SAFETY: reading the thread-local errno is always valid.
+    unsafe { *libc::__error() }
+}
+
+/// Last OS error number for the chown/xattr paths. macOS exposes it as
+/// `__error`, every other unix as `__errno_location`.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn last_errno() -> i32 {
+    // SAFETY: reading the thread-local errno is always valid.
+    unsafe { *libc::__errno_location() }
+}
+
 /// Parse permission bits: `755`, `0755`, `4755` or `rwxr-xr-x`.
 #[cfg(any(feature = "compress", test))]
 pub fn parse_mode(s: &str) -> Result<u32, Error> {
@@ -132,7 +151,7 @@ pub fn format_mode_symbolic(mode: u32) -> String {
     s
 }
 
-#[cfg(any(feature = "compress", test))]
+#[cfg(all(unix, any(feature = "compress", test)))]
 fn resolve_user(name: &str) -> Result<u32, Error> {
     let cname =
         CString::new(name).map_err(|_| Error::Meta(format!("bad user name: {name}")))?;
@@ -149,7 +168,17 @@ fn resolve_user(name: &str) -> Result<u32, Error> {
     }
 }
 
-#[cfg(any(feature = "compress", test))]
+/// Windows has no passwd database: names cannot be resolved, callers
+/// must use numeric uids (the numeric path in `parse_id_or_name` still
+/// works, so archives stay portable).
+#[cfg(all(windows, any(feature = "compress", test)))]
+fn resolve_user(name: &str) -> Result<u32, Error> {
+    Err(Error::Meta(format!(
+        "unknown user '{name}' on Windows (use a numeric uid)"
+    )))
+}
+
+#[cfg(all(unix, any(feature = "compress", test)))]
 fn resolve_group(name: &str) -> Result<u32, Error> {
     let cname =
         CString::new(name).map_err(|_| Error::Meta(format!("bad group name: {name}")))?;
@@ -163,6 +192,14 @@ fn resolve_group(name: &str) -> Result<u32, Error> {
         }
         Ok((*gr).gr_gid)
     }
+}
+
+/// Windows has no group database: see `resolve_user`.
+#[cfg(all(windows, any(feature = "compress", test)))]
+fn resolve_group(name: &str) -> Result<u32, Error> {
+    Err(Error::Meta(format!(
+        "unknown group '{name}' on Windows (use a numeric gid)"
+    )))
 }
 
 #[cfg(any(feature = "compress", test))]
@@ -217,6 +254,7 @@ pub fn parse_context(s: &str) -> Result<String, Error> {
     Ok(s.to_string())
 }
 
+#[cfg(unix)]
 fn c_path(path: &Path) -> Result<CString, Error> {
     CString::new(path.as_os_str().as_bytes())
         .map_err(|_| Error::Meta(format!("path contains NUL: {}", path.display())))
@@ -225,14 +263,14 @@ fn c_path(path: &Path) -> Result<CString, Error> {
 /// Read the `security.selinux` xattr without following symlinks.
 ///
 /// Returns `Ok(None)` when the filesystem entry has no context stored.
-# [cfg(feature = "compress")]
+# [cfg(all(unix, not(target_os = "macos"), feature = "compress"))]
 fn read_context(path: &Path) -> Result<Option<String>, Error> {
     let cpath = c_path(path)?;
     let attr = CString::new("security.selinux").unwrap();
     // SAFETY: valid pointers; NULL buffer with size 0 queries the length.
     let size = unsafe { libc::lgetxattr(cpath.as_ptr(), attr.as_ptr(), std::ptr::null_mut(), 0) };
     if size < 0 {
-        let errno = unsafe { *libc::__errno_location() };
+        let errno = last_errno();
         if errno == libc::ENODATA || errno == libc::ENOTSUP {
             return Ok(None);
         }
@@ -267,9 +305,68 @@ fn read_context(path: &Path) -> Result<Option<String>, Error> {
         .map_err(|_| Error::Meta(format!("non-UTF8 context on {}", path.display())))
 }
 
+/// macOS has no `lgetxattr`: same query via `getxattr` + `XATTR_NOFOLLOW`.
+/// `security.selinux` never exists there, so this returns `Ok(None)` in
+/// practice — but the no-follow semantics stay exact.
+# [cfg(all(target_os = "macos", feature = "compress"))]
+fn read_context(path: &Path) -> Result<Option<String>, Error> {
+    let cpath = c_path(path)?;
+    let attr = CString::new("security.selinux").unwrap();
+    // SAFETY: valid pointers; NULL buffer with size 0 queries the length.
+    let size = unsafe {
+        libc::getxattr(
+            cpath.as_ptr(),
+            attr.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    if size < 0 {
+        let errno = last_errno();
+        if errno == libc::ENODATA || errno == libc::ENOTSUP {
+            return Ok(None);
+        }
+        return Err(Error::Meta(format!(
+            "getxattr failed for {}: errno {errno}",
+            path.display()
+        )));
+    }
+    // Include space for the trailing NUL the kernel reports in the size.
+    let mut buf = vec![0u8; (size as usize) + 1];
+    // SAFETY: buffer is large enough for `size` bytes.
+    let got = unsafe {
+        libc::getxattr(
+            cpath.as_ptr(),
+            attr.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            size as usize,
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    if got < 0 {
+        return Err(Error::Meta(format!(
+            "getxattr read failed for {}",
+            path.display()
+        )));
+    }
+    let mut raw = buf[..got as usize].to_vec();
+    if raw.last() == Some(&0) {
+        raw.pop();
+    }
+    String::from_utf8(raw)
+        .map(Some)
+        .map_err(|_| Error::Meta(format!("non-UTF8 context on {}", path.display())))
+}
+
 /// Fill the missing fields of `meta` from the filesystem (no symlink
 /// following: a symlink contributes its own `lstat` data).
-# [cfg(feature = "compress")]
+///
+/// Windows variant below: no unix mode/uid/gid/xattr exist, so only the
+/// readonly flag is mapped to a mode; owner/context stay empty.
+# [cfg(all(unix, feature = "compress"))]
 pub fn fill_preserve(meta: &mut FileMeta, path: &Path, preserve: Preserve) -> Result<(), Error> {
     if !preserve.any() {
         return Ok(());
@@ -289,6 +386,21 @@ pub fn fill_preserve(meta: &mut FileMeta, path: &Path, preserve: Preserve) -> Re
     if preserve.context && meta.context.is_none() {
         meta.context = read_context(path)?;
     }
+    Ok(())
+}
+
+# [cfg(all(windows, feature = "compress"))]
+pub fn fill_preserve(meta: &mut FileMeta, path: &Path, preserve: Preserve) -> Result<(), Error> {
+    if !preserve.any() {
+        return Ok(());
+    }
+    if preserve.perms && meta.mode.is_none() {
+        let readonly = fs::symlink_metadata(path)
+            .map(|st| st.permissions().readonly())
+            .unwrap_or(false);
+        meta.mode = Some(if readonly { 0o444 } else { 0o644 });
+    }
+    // Owner/context are not representable on Windows: leave them empty.
     Ok(())
 }
 
@@ -363,6 +475,15 @@ impl MetaFilter {
     }
 }
 
+/// Windows chmod mapping: no unix mode bits exist, only the readonly
+/// flag (any write bit set = writable, mirroring the MSVCRT `_chmod`).
+#[cfg(windows)]
+fn set_readonly_flag(path: &Path, mode: u32) -> std::io::Result<()> {
+    let mut perm = fs::metadata(path)?.permissions();
+    perm.set_readonly(mode & 0o222 == 0);
+    fs::set_permissions(path, perm)
+}
+
 /// Apply stored metadata, restricted to the categories in `filter`.
 ///
 /// `chmod` is skipped for symlinks (Linux symlinks are always 0777).
@@ -379,7 +500,11 @@ pub fn apply_filtered(
     if filter.perms {
         if let Some(mode) = meta.mode {
             if !is_symlink {
-                if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(mode)) {
+                #[cfg(unix)]
+                let res = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+                #[cfg(windows)]
+                let res = set_readonly_flag(path, mode);
+                if let Err(e) = res {
                     warnings.push(format!("chmod {what}: {e}"));
                 }
             }
@@ -387,34 +512,47 @@ pub fn apply_filtered(
     }
 
     if filter.owner && (meta.uid.is_some() || meta.gid.is_some()) {
-        let cpath = match c_path(path) {
-            Ok(p) => p,
-            Err(e) => {
-                warnings.push(format!("chown {what}: {e}"));
-                return warnings;
+        #[cfg(unix)]
+        {
+            let cpath = match c_path(path) {
+                Ok(p) => p,
+                Err(e) => {
+                    warnings.push(format!("chown {what}: {e}"));
+                    return warnings;
+                }
+            };
+            // Unspecified side keeps its current value.
+            let (cur_uid, cur_gid) = fs::symlink_metadata(path)
+                .map(|st| (st.uid(), st.gid()))
+                .unwrap_or((u32::MAX, u32::MAX));
+            let uid = meta.uid.unwrap_or(cur_uid);
+            let gid = meta.gid.unwrap_or(cur_gid);
+            // SAFETY: valid path pointer, plain integer ids.
+            let rc = unsafe {
+                if is_symlink {
+                    libc::lchown(cpath.as_ptr(), uid, gid)
+                } else {
+                    libc::chown(cpath.as_ptr(), uid, gid)
+                }
+            };
+            if rc != 0 {
+                let errno = last_errno();
+                warnings.push(format!("chown {what} to {uid}:{gid}: errno {errno}"));
             }
-        };
-        // Unspecified side keeps its current value.
-        let (cur_uid, cur_gid) = fs::symlink_metadata(path)
-            .map(|st| (st.uid(), st.gid()))
-            .unwrap_or((u32::MAX, u32::MAX));
-        let uid = meta.uid.unwrap_or(cur_uid);
-        let gid = meta.gid.unwrap_or(cur_gid);
-        // SAFETY: valid path pointer, plain integer ids.
-        let rc = unsafe {
-            if is_symlink {
-                libc::lchown(cpath.as_ptr(), uid, gid)
-            } else {
-                libc::chown(cpath.as_ptr(), uid, gid)
-            }
-        };
-        if rc != 0 {
-            let errno = unsafe { *libc::__errno_location() };
-            warnings.push(format!("chown {what} to {uid}:{gid}: errno {errno}"));
+        }
+        #[cfg(windows)]
+        {
+            let _ = is_symlink;
+            warnings.push(format!(
+                "chown {what} to {}:{}: unsupported on Windows",
+                meta.uid.map(|u| u.to_string()).unwrap_or_else(|| "-".to_string()),
+                meta.gid.map(|g| g.to_string()).unwrap_or_else(|| "-".to_string())
+            ));
         }
     }
 
     if filter.context {
+        #[cfg(all(unix, not(target_os = "macos")))]
         if let Some(ctx) = &meta.context {
             match (c_path(path), CString::new(ctx.as_str())) {
                 (Ok(cpath), Ok(cctx)) => {
@@ -430,12 +568,42 @@ pub fn apply_filtered(
                         )
                     };
                     if rc != 0 {
-                        let errno = unsafe { *libc::__errno_location() };
+                        let errno = last_errno();
                         warnings.push(format!("setxattr {what}: errno {errno}"));
                     }
                 }
                 _ => warnings.push(format!("setxattr {what}: bad path or context")),
             }
+        }
+        // macOS setxattr with XATTR_NOFOLLOW (same no-follow semantics as
+        // lsetxattr; fails cleanly when the fs has no xattr support).
+        #[cfg(target_os = "macos")]
+        if let Some(ctx) = &meta.context {
+            match (c_path(path), CString::new(ctx.as_str())) {
+                (Ok(cpath), Ok(cctx)) => {
+                    let attr = CString::new("security.selinux").unwrap();
+                    // SAFETY: pointers and length describe the context bytes.
+                    let rc = unsafe {
+                        libc::setxattr(
+                            cpath.as_ptr(),
+                            attr.as_ptr(),
+                            cctx.as_ptr() as *const libc::c_void,
+                            ctx.len(),
+                            0,
+                            libc::XATTR_NOFOLLOW,
+                        )
+                    };
+                    if rc != 0 {
+                        let errno = last_errno();
+                        warnings.push(format!("setxattr {what}: errno {errno}"));
+                    }
+                }
+                _ => warnings.push(format!("setxattr {what}: bad path or context")),
+            }
+        }
+        #[cfg(windows)]
+        if meta.context.is_some() {
+            warnings.push(format!("setxattr {what}: unsupported on Windows"));
         }
     }
 
@@ -464,9 +632,14 @@ mod tests {
     #[test]
     fn owner_forms() {
         assert_eq!(parse_owner("0:2000").unwrap(), (Some(0), Some(2000)));
-        assert_eq!(parse_owner("root").unwrap(), (Some(0), None));
         assert_eq!(parse_owner("0").unwrap(), (Some(0), None));
-        assert_eq!(parse_owner("root:root").unwrap(), (Some(0), Some(0)));
+        // Name resolution needs the passwd/group database (unix only);
+        // on Windows only numeric ids parse.
+        #[cfg(unix)]
+        {
+            assert_eq!(parse_owner("root").unwrap(), (Some(0), None));
+            assert_eq!(parse_owner("root:root").unwrap(), (Some(0), Some(0)));
+        }
         assert!(parse_owner("nosuchuser12345").is_err());
     }
 }

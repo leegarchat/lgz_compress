@@ -12,12 +12,23 @@ TARGET_X64="x86_64-unknown-linux-musl"
 TARGET_X86="i686-unknown-linux-musl"
 TARGET_ARM64="aarch64-unknown-linux-musl"
 TARGET_ARM32="armv7-unknown-linux-musleabihf"
+# Windows (lean/unpack-only flavor; MinGW for x64, llvm-mingw for ARM64 —
+# distro mingw has no aarch64 Windows linker, same as bootsmasher).
+WIN_X64="x86_64-pc-windows-gnu"
+WIN_ARM64="aarch64-pc-windows-gnullvm"
+# macOS (full + lean universal binaries via cargo-zigbuild on Linux,
+# plain cargo on a Mac).
+MAC_X64="x86_64-apple-darwin"
+MAC_ARM64="aarch64-apple-darwin"
+
+# llvm-mingw (mstorsjo) provides the only native aarch64 Windows linker.
+LLVM_MINGW_CLANG="/opt/llvm-mingw/bin/aarch64-w64-mingw32-clang"
 
 ALL_TARGETS=("$TARGET_X64" "$TARGET_X86" "$TARGET_ARM64" "$TARGET_ARM32")
 
 # Default parameters
 METHOD="auto"         # auto | cargo | cross
-SELECTED_ARCH="all"   # all | x64 | x86 | arm64 | arm32
+SELECTED_ARCH="all"   # all | x64 | x86 | arm64 | arm32 | windows | win64 | winarm64 | mac | mac64 | macarm64
 
 usage() {
     cat <<EOF
@@ -31,12 +42,27 @@ Build method options:
 
 Architecture selection:
   --arch <type>    Build a specific architecture:
-                     all   - All 4 platforms (default)
+                     all   - All 4 Linux platforms (default)
                      x64   - x86_64-unknown-linux-musl
                      x86   - i686-unknown-linux-musl
                      arm64 - aarch64-unknown-linux-musl
                      arm32 - armv7-unknown-linux-musleabihf
+                     windows  - both Windows lean (unpack-only) .exe
+                              (x64 gnu + ARM64 gnullvm)
+                     win64    - lean x86_64-pc-windows-gnu .exe
+                     winarm64 - lean aarch64-pc-windows-gnullvm .exe
+                     mac      - macOS full + lean universal binaries
+                              (fat x86_64+arm64, like fastboot)
+                     mac64    - macOS x86_64 slices (full + lean)
+                     macarm64 - macOS arm64 slices (full + lean)
   -h, --help       Show this message
+
+  Windows/macOS notes:
+    Windows ships lean (decompress-only) builds only; win64 needs
+    mingw-w64, winarm64 links with llvm-mingw from /opt/llvm-mingw.
+    macOS cross from Linux needs cargo-zigbuild + zig (on a Mac plain
+    cargo is enough); the fat binary is glued with llvm-lipo (Linux)
+    or lipo (Xcode).
 
 Examples:
   $0 --cargo --arch x64
@@ -46,6 +72,12 @@ Examples:
 Outputs:
   dist/                      Static binaries lgz_compress-linux-*
                              (full build: compress + pack + unpack)
+                             Windows lean .exe: lgz_compress-windows-*.exe
+                             (decompress-only; no push copies for Windows)
+                             macOS: lgz_compress-macos-* slices plus
+                             lgz_compress-macos-universal and
+                             lgz_compress-lean-macos-universal
+                             (fat x86_64+arm64)
   target/push/               8 push-ready copies, both flavors per arch:
                              {name}_full_{x64,x86,arm64,arm32} (full),
                              {name}_lean_{x64,x86,arm64,arm32}
@@ -142,6 +174,11 @@ suggest_install() {
                 ;;
         esac
     fi
+    echo "Windows x86_64 also needs: mingw-w64 (rustup target add $WIN_X64)"
+    echo "Windows ARM64 links via llvm-mingw (mstorsjo), not distro mingw:"
+    echo "  curl -LO https://github.com/mstorsjo/llvm-mingw/releases/download/20240619/llvm-mingw-20240619-ucrt-ubuntu-20.04-x86_64.tar.xz"
+    echo "  sudo tar -xf llvm-mingw-20240619-ucrt-ubuntu-20.04-x86_64.tar.xz -C /opt/ && sudo mv /opt/llvm-mingw-20240619-ucrt-ubuntu-20.04-x86_64 /opt/llvm-mingw"
+    echo "macOS cross from Linux needs: cargo-zigbuild + zig (pip install ziglang), llvm-lipo for the fat binary"
     echo "============================================================"
     echo ""
 }
@@ -179,6 +216,23 @@ check_cargo_linker() {
     return 0
 }
 
+# Graceful skip for optional (Windows/macOS) targets: a missing
+# toolchain skips the target instead of failing the whole run.
+check_opt_linker() {
+    case "$1" in
+        "$WIN_X64")
+            command -v x86_64-w64-mingw32-gcc &>/dev/null || [[ -x /usr/bin/x86_64-w64-mingw32-gcc ]]
+            ;;
+        "$WIN_ARM64")
+            [[ -x "$LLVM_MINGW_CLANG" ]]
+            ;;
+        "$MAC_X64"|"$MAC_ARM64")
+            [[ "$(uname -s)" == "Darwin" ]] && return 0
+            command -v cargo-zigbuild &>/dev/null && command -v zig &>/dev/null
+            ;;
+    esac
+}
+
 # Resolve final builder
 BUILDER=""
 if [[ "$METHOD" == "cross" ]]; then
@@ -203,11 +257,12 @@ echo "==> Build mode: $BUILDER (selected by rule: $METHOD)"
 # Prepare rustup targets for cargo
 if [[ "$BUILDER" == "cargo" ]]; then
     echo "==> Checking rustup targets..."
-    rustup target add "${ALL_TARGETS[@]}" >/dev/null 2>&1 || true
+    rustup target add "${ALL_TARGETS[@]}" "$WIN_X64" "$WIN_ARM64" "$MAC_X64" "$MAC_ARM64" >/dev/null 2>&1 || true
 fi
 
-rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
+# NOTE: dist/ is accumulative across runs (each build overwrites its own
+# files); delete it by hand for a from-scratch release set.
 
 build_target() {
     local target="$1"
@@ -222,7 +277,7 @@ build_target() {
     setup_linkers "$target"
 
     # 1) Full build (default features): host utility for dist/.
-    run_builder "$target" ""
+    run_builder "$target"
     local src_bin="$SCRIPT_DIR/target/$target/release/$BIN_NAME"
     local dst_bin="$DIST_DIR/${BIN_NAME}-${output_name}"
 
@@ -295,6 +350,24 @@ setup_linkers() {
     if [[ "$BUILDER" != "cargo" ]]; then
         return 0
     fi
+    case "$target" in
+        "$WIN_X64")
+            # Absolute distro path: /opt/llvm-mingw shadows the gcc name
+            # with a clang shim when it leaks into PATH.
+            if [[ -x /usr/bin/x86_64-w64-mingw32-gcc ]]; then
+                export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="/usr/bin/x86_64-w64-mingw32-gcc"
+            fi
+            return 0
+            ;;
+        "$WIN_ARM64")
+            export CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER="$LLVM_MINGW_CLANG"
+            return 0
+            ;;
+        "$MAC_X64"|"$MAC_ARM64")
+            # zigbuild drives its own linker.
+            return 0
+            ;;
+    esac
     if ! check_cargo_linker "$target"; then
         exit 1
     fi
@@ -317,15 +390,131 @@ setup_linkers() {
 }
 
 # Run the selected builder for one target; extra args (feature flags)
-# are appended to the build command.
+# are appended to the build command. macOS cross from Linux always goes
+# through cargo-zigbuild (cross has no macOS images); Windows ARM64
+# always uses host cargo (cross has no winarm64 image either).
 run_builder() {
     local target="$1"
     shift
-    if [[ "$BUILDER" == "cross" ]]; then
+    local b="$BUILDER"
+    if [[ "$target" == *apple-darwin* && "$(uname -s)" != "Darwin" ]]; then
+        b="zigbuild"
+    fi
+    if [[ "$target" == "$WIN_ARM64" ]]; then
+        b="cargo"
+    fi
+    if [[ "$b" == "cross" ]]; then
         cross build --release --target "$target" "$@"
+    elif [[ "$b" == "zigbuild" ]]; then
+        cargo zigbuild --release --target "$target" "$@"
     else
         cargo build --release --target "$target" "$@"
     fi
+}
+
+# Windows lean-only build (decompress-only: unpack/inspect for the
+# desktop side). No push copies: those are adb/device-bound (Linux).
+build_lean_windows() {
+    local target="$1"
+    local output_name="$2"
+
+    echo ""
+    echo "------------------------------------------------------------"
+    echo "Building [$output_name] -> $target (lean)"
+    echo "------------------------------------------------------------"
+
+    if [[ "$BUILDER" == "cargo" ]] && ! check_opt_linker "$target"; then
+        suggest_install "cargo-tools"
+        echo "Skipping $target (no linker)."
+        return 0
+    fi
+    setup_linkers "$target"
+    run_builder "$target" "--no-default-features"
+
+    local src_bin="$SCRIPT_DIR/target/$target/release/${BIN_NAME}.exe"
+    local dst_bin="$DIST_DIR/${BIN_NAME}-${output_name}.exe"
+    if [[ -f "$src_bin" ]]; then
+        cp "$src_bin" "$dst_bin"
+        local size
+        size=$(stat -c%s "$dst_bin" 2>/dev/null || stat -f%z "$dst_bin")
+        echo "Success: $dst_bin ($size bytes) [lean]"
+    else
+        echo "Error: compiled binary not found: $src_bin"
+        exit 1
+    fi
+}
+
+# Glue two per-arch Mach-O slices into one universal binary, exactly
+# like Google's own fastboot/adb. Needs llvm-lipo (Linux) or lipo
+# (Xcode); without either the slices stay as-is and nothing fails.
+combine_universal() {
+    local kind="$1" # full | lean
+    local a b out
+    if [[ "$kind" == "lean" ]]; then
+        a="$DIST_DIR/${BIN_NAME}-lean-macos-x86_64"
+        b="$DIST_DIR/${BIN_NAME}-lean-macos-arm64"
+        out="$DIST_DIR/${BIN_NAME}-lean-macos-universal"
+    else
+        a="$DIST_DIR/${BIN_NAME}-macos-x86_64"
+        b="$DIST_DIR/${BIN_NAME}-macos-arm64"
+        out="$DIST_DIR/${BIN_NAME}-macos-universal"
+    fi
+    [[ -f "$a" && -f "$b" ]] || return 0
+    local tool=""
+    command -v llvm-lipo &>/dev/null && tool="llvm-lipo"
+    if [[ -z "$tool" ]]; then command -v lipo &>/dev/null && tool="lipo"; fi
+    if [[ -z "$tool" ]]; then
+        echo "no llvm-lipo/lipo: leaving per-arch macOS slices ($a, $b)"
+        return 0
+    fi
+    "$tool" -create -output "$out" "$a" "$b"
+    local size
+    size=$(stat -c%s "$out" 2>/dev/null || stat -f%z "$out")
+    echo "Universal: $out ($size bytes)"
+}
+
+# One macOS arch, both flavors (full + lean) into dist/.
+build_macos_slice() {
+    local target="$1"
+    local output_name="$2"
+
+    echo ""
+    echo "------------------------------------------------------------"
+    echo "Building [$output_name] -> $target (full + lean)"
+    echo "------------------------------------------------------------"
+
+    if [[ "$BUILDER" == "cargo" ]] && ! check_opt_linker "$target"; then
+        suggest_install "cargo-tools"
+        echo "Skipping $target (no toolchain)."
+        return 0
+    fi
+    setup_linkers "$target"
+
+    run_builder "$target"
+    local src_bin="$SCRIPT_DIR/target/$target/release/$BIN_NAME"
+    if [[ -f "$src_bin" ]]; then
+        cp "$src_bin" "$DIST_DIR/${BIN_NAME}-${output_name}"
+        echo "Success: $DIST_DIR/${BIN_NAME}-${output_name} [full]"
+    else
+        echo "Error: compiled binary not found: $src_bin"
+        exit 1
+    fi
+
+    run_builder "$target" "--no-default-features"
+    if [[ -f "$src_bin" ]]; then
+        cp "$src_bin" "$DIST_DIR/${BIN_NAME}-lean-${output_name}"
+        echo "Success: $DIST_DIR/${BIN_NAME}-lean-${output_name} [lean]"
+    else
+        echo "Error: compiled binary not found: $src_bin"
+        exit 1
+    fi
+}
+
+build_macos() {
+    build_macos_slice "$MAC_X64" "macos-x86_64"
+    build_macos_slice "$MAC_ARM64" "macos-arm64"
+    combine_universal full
+    combine_universal lean
 }
 
 # Build tasks (3rd arg = short arch for target/push/{name}_{full,lean}_{arch})
@@ -348,6 +537,25 @@ case "$SELECTED_ARCH" in
     arm32)
         build_target "$TARGET_ARM32" "linux-arm32"  "arm32"
         ;;
+    windows)
+        build_lean_windows "$WIN_X64" "windows-x64"
+        build_lean_windows "$WIN_ARM64" "windows-arm64"
+        ;;
+    win64)
+        build_lean_windows "$WIN_X64" "windows-x64"
+        ;;
+    winarm64)
+        build_lean_windows "$WIN_ARM64" "windows-arm64"
+        ;;
+    mac)
+        build_macos
+        ;;
+    mac64)
+        build_macos_slice "$MAC_X64" "macos-x86_64"
+        ;;
+    macarm64)
+        build_macos_slice "$MAC_ARM64" "macos-arm64"
+        ;;
     *)
         echo "Error: unknown architecture '$SELECTED_ARCH'"
         usage
@@ -358,6 +566,8 @@ echo ""
 echo "============================================================"
 echo "Done! Generated binaries in dist/ (full flavor):"
 ls -lh "$DIST_DIR"
-echo "Push-ready copies in target/push/ (full + decompress-only per arch):"
-ls -lh "$PUSH_DIR" | awk '{print $9, "(" $5 ")"}'
+if [[ -d "$PUSH_DIR" ]]; then
+    echo "Push-ready copies in target/push/ (full + decompress-only per arch):"
+    ls -lh "$PUSH_DIR" | awk '{print $9, "(" $5 ")"}'
+fi
 echo "============================================================"

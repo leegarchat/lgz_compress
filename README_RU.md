@@ -2,7 +2,7 @@
 
 > Автономный Rust-порт бинарного компрессора `lgz`: ELF-ориентированный препроцессинг (нормализация переходов ARM64/x86, разделение на байтовые плоскости, дельта-кодирование) + LZMA2 с брутфорс-оптимизатором, одиночные архивы и solid-мультиконтейнеры с метаданными и прозрачным инжестом ZIP.
 
-Утилита полностью автономна: чистый безопасный Rust без C-зависимостей, поставляется полностью статическими musl-бинарниками (x86_64, x86, aarch64, armv7). Хостовая сборка умеет паковать (`compress`, `pack`); облегченный decompress-only вариант (`--no-default-features`, он же едет в `target/push/` на устройство) только распаковывает и инспектирует. Пейлоады одиночных архивов (UCOMP01) побайтово совместимы с оригинальной C-утилитой в обе стороны.
+Утилита полностью автономна: чистый безопасный Rust без C-зависимостей, поставляется полностью статическими musl-бинарниками (x86_64, x86, aarch64, armv7), Windows lean .exe (x64, ARM64) и macOS universal-бинарниками (x86_64+arm64). Хостовая сборка умеет паковать (`compress`, `pack`); облегченный decompress-only вариант (`--no-default-features`, он же едет в `target/push/` на устройство) только распаковывает и инспектирует. Пейлоады одиночных архивов (UCOMP01) побайтово совместимы с оригинальной C-утилитой в обе стороны.
 
 ---
 
@@ -102,10 +102,12 @@ cargo build --release --no-default-features
 
 # Статические мультиархитектурные сборки через build.sh (musl, stripped):
 #   --cargo | --cross | --auto   метод сборки (auto = cross при наличии контейнеров, иначе cargo)
-#   --arch all|x64|x86|arm64|arm32
+#   --arch all|x64|x86|arm64|arm32|windows|win64|winarm64|mac|mac64|macarm64
 ./build.sh --cargo --arch x64      # x86_64-unknown-linux-musl
 ./build.sh --cross --arch arm64    # aarch64 через контейнеры
 ./build.sh --arch all              # x86_64, x86, aarch64, armv7
+./build.sh --cargo --arch windows  # оба Windows lean (только распаковка) .exe
+./build.sh --cargo --arch mac      # macOS full + lean universal-бинарники
 
 # Проверки
 cargo test                  # полная версия: 5 passed
@@ -115,6 +117,8 @@ cargo test --no-default-features   # облегченная версия: 4 pass
 Выходы сборки:
 
 * `dist/` — статические бинарники `lgz_compress-linux-*`, **полная** версия (compress + pack + unpack).
+* `dist/lgz_compress-windows-*.exe` — Windows **lean**-сборки (только распаковка); x64 проверен на живом железе, ARM64 скросс-компилирован (для запуска нужен ARM).
+* `dist/lgz_compress-{,lean-}macos-universal` — macOS fat-бинарники (x86_64+arm64); скросс-линкованы, для рантайм-проверки нужен Mac.
 * `target/push/` — 8 push-копий, обе версии под каждую архитектуру, например:
   `adb push target/push/lgz_compress_lean_arm64 /data/local/` (`dist/` и `target/` в gitignore).
 

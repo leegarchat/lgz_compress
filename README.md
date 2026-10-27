@@ -2,7 +2,7 @@
 
 > Standalone Rust port of the `lgz` binary compressor: ELF-aware preprocessing (ARM64/x86 branch normalization, byte-plane splitting, delta coding) + LZMA2 with a brute-force optimizer, single-file archives and solid multi-file containers with metadata and transparent ZIP ingestion.
 
-The utility is completely standalone: pure safe Rust with no C dependencies, shipped as fully static musl binaries (x86_64, x86, aarch64, armv7). The host build packs (`compress`, `pack`); the decompress-only build flavor (`--no-default-features`, used for `target/push/` device binaries) unpacks and inspects only. Single-file payloads (UCOMP01) stay wire-compatible with the original C tool in both directions.
+The utility is completely standalone: pure safe Rust with no C dependencies, shipped as fully static musl binaries (x86_64, x86, aarch64, armv7), Windows lean .exe (x64, ARM64) and macOS universal binaries (x86_64+arm64). The host build packs (`compress`, `pack`); the decompress-only build flavor (`--no-default-features`, used for `target/push/` device binaries) unpacks and inspects only. Single-file payloads (UCOMP01) stay wire-compatible with the original C tool in both directions.
 
 ---
 
@@ -102,10 +102,12 @@ cargo build --release --no-default-features
 
 # Static multi-arch builds via build.sh (musl, stripped):
 #   --cargo | --cross | --auto   build method (auto = cross if containers exist, else cargo)
-#   --arch all|x64|x86|arm64|arm32
+#   --arch all|x64|x86|arm64|arm32|windows|win64|winarm64|mac|mac64|macarm64
 ./build.sh --cargo --arch x64      # x86_64-unknown-linux-musl
 ./build.sh --cross --arch arm64    # aarch64 via containers
 ./build.sh --arch all              # x86_64, x86, aarch64, armv7
+./build.sh --cargo --arch windows  # both Windows lean (unpack-only) .exe
+./build.sh --cargo --arch mac      # macOS full + lean universal binaries
 
 # Checks
 cargo test                  # full flavor: 5 passed
@@ -115,6 +117,8 @@ cargo test --no-default-features   # lean flavor: 4 passed
 Build outputs:
 
 * `dist/` — static binaries `lgz_compress-linux-*`, **full** flavor (compress + pack + unpack).
+* `dist/lgz_compress-windows-*.exe` — Windows **lean** builds (decompress-only); x64 tested on real hardware, ARM64 cross-compiled (needs ARM hardware to execute).
+* `dist/lgz_compress-{,lean-}macos-universal` — macOS fat binaries (x86_64+arm64); cross-linked, needs a Mac for runtime testing.
 * `target/push/` — 8 push-ready copies, both flavors per arch, e.g.:
   `adb push target/push/lgz_compress_lean_arm64 /data/local/` (both `dist/` and `target/` are gitignored).
 

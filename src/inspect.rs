@@ -202,7 +202,7 @@ fn place_link(full: &Path, target: &str, entry_path: &str) -> Result<(), Error> 
         }
         fs::remove_file(full)?;
     }
-    std::os::unix::fs::symlink(target, full)?;
+    pack::place_symlink(target, full)?;
     Ok(())
 }
 
